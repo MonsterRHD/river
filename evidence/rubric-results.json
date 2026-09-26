@@ -2,12 +2,12 @@
   {
     "id": 1,
     "passed": false,
-    "reason": "PostgreSQL 127.0.0.1:5432 connection refused；本条数据库持久状态行为没有执行验证"
+    "reason": "数据库服务未启动，连接 127.0.0.1:5432 被拒绝；本条数据库持久状态行为没有执行验证"
   },
   {
     "id": 2,
     "passed": false,
-    "reason": "PostgreSQL 127.0.0.1:5432 connection refused；本条数据库持久状态行为没有执行验证"
+    "reason": "数据库服务未启动，连接 127.0.0.1:5432 被拒绝；本条数据库持久状态行为没有执行验证"
   },
   {
     "id": 3,
@@ -32,11 +32,11 @@
   {
     "id": 7,
     "passed": false,
-    "reason": "PostgreSQL 127.0.0.1:5432 connection refused；本条数据库持久状态行为没有执行验证"
+    "reason": "数据库服务未启动，连接 127.0.0.1:5432 被拒绝；本条数据库持久状态行为没有执行验证"
   },
   {
     "id": 8,
     "passed": false,
-    "reason": "PostgreSQL 127.0.0.1:5432 connection refused；本条数据库持久状态行为没有执行验证"
+    "reason": "数据库服务未启动，连接 127.0.0.1:5432 被拒绝；本条数据库持久状态行为没有执行验证"
   }
 ]
