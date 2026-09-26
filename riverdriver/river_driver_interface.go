@@ -291,6 +291,13 @@ type Executor interface {
 	NotifyMany(ctx context.Context, params *NotifyManyParams) error
 	PGAdvisoryXactLock(ctx context.Context, key int64) (*struct{}, error)
 
+	ProducerDeleteReaped(ctx context.Context, params *ProducerDeleteReapedParams) ([]*Producer, error)
+	ProducerFinish(ctx context.Context, params *ProducerFinishParams) (*Producer, error)
+	ProducerGet(ctx context.Context, params *ProducerGetParams) (*Producer, error)
+	ProducerInsert(ctx context.Context, params *ProducerInsertParams) (*Producer, error)
+	ProducerKeepAlive(ctx context.Context, params *ProducerKeepAliveParams) (*Producer, error)
+	ProducerReapExpired(ctx context.Context, params *ProducerReapExpiredParams) ([]*Producer, error)
+
 	QueueCreateOrSetUpdatedAt(ctx context.Context, params *QueueCreateOrSetUpdatedAtParams) (*rivertype.Queue, error)
 	QueueDeleteExpired(ctx context.Context, params *QueueDeleteExpiredParams) ([]string, error)
 	QueueGet(ctx context.Context, params *QueueGetParams) (*rivertype.Queue, error)
@@ -848,11 +855,103 @@ type NotificationDeleteBeforeParams struct {
 	Schema           string
 }
 
+// Producer is a single producer's lease row. A producer is a client working
+// jobs in a particular queue.
+//
+// The lease is held by a single process startup, identified by ProducerID and
+// fenced by Generation: each time the (QueueName, ClientID) slot is acquired,
+// Generation is incremented, invalidating any in-flight writes from a prior
+// generation. ReapedAt is nil while the lease is active and set when the
+// producer released it gracefully or the leader reaped it after ExpiresAt
+// passed.
+//
+// API is not stable. DO NOT USE.
+type Producer struct {
+	ClientID   string
+	QueueName  string
+	ProducerID int64
+	Generation int64
+	MaxWorkers int64
+
+	CreatedAt time.Time
+	UpdatedAt time.Time
+	ExpiresAt time.Time
+	ReapedAt  *time.Time
+}
+
+// ProducerDeleteReapedParams are parameters for physically deleting producer
+// lease rows that were reaped before a time horizon.
+//
+// API is not stable. DO NOT USE.
+type ProducerDeleteReapedParams struct {
+	Max             int
+	ReapedAtHorizon time.Time
+	Schema          string
+}
+
+// ProducerFinishParams are parameters for gracefully releasing a producer
+// lease. The release only takes effect when ClientID, QueueName, and
+// Generation match the lease's current generation and the lease hasn't already
+// been reaped; a mismatched or reaped lease returns ErrNotFound instead.
+//
+// API is not stable. DO NOT USE.
+type ProducerFinishParams struct {
+	ClientID   string
+	Generation int64
+	Now        *time.Time
+	QueueName  string
+	Schema     string
+}
+
+// ProducerGetParams are parameters for fetching a single producer lease by its
+// (queue name, client ID) slot.
+//
+// API is not stable. DO NOT USE.
+type ProducerGetParams struct {
+	ClientID  string
+	QueueName string
+	Schema    string
+}
+
+// ProducerInsertParams are parameters for acquiring a producer lease. A new
+// row is inserted, or if the (queue name, client ID) slot already exists, its
+// generation is incremented, the row is associated with the new producer ID,
+// and any prior reap marker is cleared.
+//
+// API is not stable. DO NOT USE.
+type ProducerInsertParams struct {
+	ClientID   string
+	MaxWorkers int
+	Now        *time.Time
+	ProducerID int64
+	QueueName  string
+	Schema     string
+	TTL        time.Duration
+}
+
+// ProducerKeepAliveParams are parameters for renewing a producer lease. The
+// renewal only takes effect when ClientID, QueueName, and Generation match
+// the lease's current generation and the lease hasn't been reaped; a
+// mismatched or reaped lease returns ErrNotFound instead.
+//
+// API is not stable. DO NOT USE.
 type ProducerKeepAliveParams struct {
-	ID                    int64
-	QueueName             string
-	Schema                string
-	StaleUpdatedAtHorizon time.Time
+	ClientID   string
+	Generation int64
+	Now        *time.Time
+	QueueName  string
+	Schema     string
+	TTL        time.Duration
+}
+
+// ProducerReapExpiredParams are parameters for reaping producer leases whose
+// expiration time has passed and which haven't already been reaped.
+//
+// API is not stable. DO NOT USE.
+type ProducerReapExpiredParams struct {
+	Max    int
+	Now    *time.Time
+	Schema string
 }
 
 type QueueCreateOrSetUpdatedAtParams struct {
@@ -963,8 +1062,10 @@ func MigrationLineMainTruncateTables(version int) []string {
 		return []string{"river_job", "river_leader", "river_queue"}
 	case 5, 6:
 		return []string{"river_job", "river_leader", "river_queue", "river_client", "river_client_queue"}
-	case 0, 7:
+	case 7:
 		return []string{"river_job", "river_leader", "river_queue", "river_notification"}
+	case 0, 8:
+		return []string{"river_job", "river_leader", "river_queue", "river_notification", "river_producer"}
 	}
 
 	panic(fmt.Sprintf("unrecognized migration version: %d", version))

@@ -13,6 +13,7 @@ import (
 
 	"github.com/riverqueue/river/riverdriver"
 	"github.com/riverqueue/river/rivershared/baseservice"
+	"github.com/riverqueue/river/rivershared/riverpilot"
 	"github.com/riverqueue/river/rivershared/startstop"
 	"github.com/riverqueue/river/rivershared/testsignal"
 	"github.com/riverqueue/river/rivershared/util/maputil"
@@ -28,12 +29,14 @@ const (
 	NotificationTopicControl    NotificationTopic = "river_control"
 	NotificationTopicInsert     NotificationTopic = "river_insert"
 	NotificationTopicLeadership NotificationTopic = "river_leadership"
+	NotificationTopicProducer   NotificationTopic = NotificationTopic(riverpilot.ProducerNotificationTopic)
 )
 
 var notificationTopicAll = []NotificationTopic{ //nolint:gochecknoglobals
 	NotificationTopicControl,
 	NotificationTopicInsert,
 	NotificationTopicLeadership,
+	NotificationTopicProducer,
 }
 
 // NotificationTopicLongest is just the longest notification topic. This is used

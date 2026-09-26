@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added persistent, renewable producer leases with a fencing generation. A working client now acquires a lease row in the new `river_producer` table on startup, renews it periodically, and releases it on graceful stop. The leader's new producer reaper marks crashed producers offline after the lease expires (publishing an exactly-once offline notification) and physically removes reaped rows after a retention period. Stale processes are fenced by generation, so a late heartbeat can't resurrect a newer lease. Clients that only enqueue jobs without working queues hold no lease. Migration 008 creates the table across the pgx, database/sql, and SQLite drivers.
+
 ### Fixed
 
 - Fixed SQLite job list pagination skipping or repeating jobs by formatting cursor timestamps consistently with stored timestamps. [PR #1374](https://github.com/riverqueue/river/pull/1374).

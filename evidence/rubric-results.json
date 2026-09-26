@@ -1,0 +1,42 @@
+[
+  {
+    "id": 1,
+    "passed": false,
+    "reason": "PostgreSQL 127.0.0.1:5432 connection refused；本条数据库持久状态行为没有执行验证"
+  },
+  {
+    "id": 2,
+    "passed": false,
+    "reason": "PostgreSQL 127.0.0.1:5432 connection refused；本条数据库持久状态行为没有执行验证"
+  },
+  {
+    "id": 3,
+    "passed": false,
+    "reason": "PostgreSQL 127.0.0.1:5432 connection refused；本条数据库持久状态行为没有执行验证"
+  },
+  {
+    "id": 4,
+    "passed": false,
+    "reason": "PostgreSQL 连接拒绝使过期租约维护用例未执行。"
+  },
+  {
+    "id": 5,
+    "passed": false,
+    "reason": "PostgreSQL 连接拒绝使迟到心跳与回收交错用例未执行。"
+  },
+  {
+    "id": 6,
+    "passed": false,
+    "reason": "PostgreSQL 连接拒绝使 leader 切换及事件去重用例未执行。"
+  },
+  {
+    "id": 7,
+    "passed": false,
+    "reason": "PostgreSQL 127.0.0.1:5432 connection refused；本条数据库持久状态行为没有执行验证"
+  },
+  {
+    "id": 8,
+    "passed": false,
+    "reason": "PostgreSQL 127.0.0.1:5432 connection refused；本条数据库持久状态行为没有执行验证"
+  }
+]

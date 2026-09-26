@@ -94,23 +94,23 @@ func TestProducer_MetricEmitHook(t *testing.T) {
 		pluginLookup := pluginlookup.NewPluginLookup([]any{metricHook})
 
 		producer := newProducer(archetype, exec, pilot, &producerConfig{
-			ClientID:                     testClientID,
-			Completer:                    completer,
-			ErrorHandler:                 newTestErrorHandler(),
-			FetchCooldown:                FetchCooldownDefault,
-			FetchPollInterval:            50 * time.Millisecond,
-			JobTimeout:                   JobTimeoutDefault,
-			MaxWorkers:                   1_000,
-			PluginLookupByJob:            pluginlookup.NewJobPluginLookup(nil),
-			PluginLookupGlobal:           pluginLookup,
-			Queue:                        queueName,
-			QueuePollInterval:            queuePollIntervalDefault,
-			QueueReportInterval:          queueReportIntervalDefault,
-			RetryPolicy:                  &DefaultClientRetryPolicy{},
-			SchedulerInterval:            riverinternaltest.SchedulerShortInterval,
-			Schema:                       schema,
-			StaleProducerRetentionPeriod: time.Minute,
-			Workers:                      NewWorkers(),
+			ClientID:            testClientID,
+			Completer:           completer,
+			ErrorHandler:        newTestErrorHandler(),
+			FetchCooldown:       FetchCooldownDefault,
+			FetchPollInterval:   50 * time.Millisecond,
+			JobTimeout:          JobTimeoutDefault,
+			MaxWorkers:          1_000,
+			PluginLookupByJob:   pluginlookup.NewJobPluginLookup(nil),
+			PluginLookupGlobal:  pluginLookup,
+			Queue:               queueName,
+			QueuePollInterval:   queuePollIntervalDefault,
+			QueueReportInterval: queueReportIntervalDefault,
+			RetryPolicy:         &DefaultClientRetryPolicy{},
+			SchedulerInterval:   riverinternaltest.SchedulerShortInterval,
+			Schema:              schema,
+			LeaseTTL:            time.Minute,
+			Workers:             NewWorkers(),
 		})
 
 		return &testBundle{
@@ -216,24 +216,24 @@ func TestProducer_PollOnly(t *testing.T) {
 		}
 
 		return newProducer(archetype, exec, pilot, &producerConfig{
-			ClientID:                     testClientID,
-			Completer:                    completer,
-			ErrorHandler:                 newTestErrorHandler(),
-			FetchCooldown:                FetchCooldownDefault,
-			FetchPollInterval:            50 * time.Millisecond, // more aggressive than normal because we have no notifier
-			PluginLookupByJob:            pluginlookup.NewJobPluginLookup(nil),
-			PluginLookupGlobal:           pluginlookup.NewPluginLookup(nil),
-			JobTimeout:                   JobTimeoutDefault,
-			MaxWorkers:                   1_000,
-			Notifier:                     nil, // no notifier
-			Queue:                        queueName,
-			QueuePollInterval:            queuePollIntervalDefault,
-			QueueReportInterval:          queueReportIntervalDefault,
-			RetryPolicy:                  &DefaultClientRetryPolicy{},
-			SchedulerInterval:            riverinternaltest.SchedulerShortInterval,
-			Schema:                       "",
-			StaleProducerRetentionPeriod: time.Minute,
-			Workers:                      NewWorkers(),
+			ClientID:            testClientID,
+			Completer:           completer,
+			ErrorHandler:        newTestErrorHandler(),
+			FetchCooldown:       FetchCooldownDefault,
+			FetchPollInterval:   50 * time.Millisecond, // more aggressive than normal because we have no notifier
+			PluginLookupByJob:   pluginlookup.NewJobPluginLookup(nil),
+			PluginLookupGlobal:  pluginlookup.NewPluginLookup(nil),
+			JobTimeout:          JobTimeoutDefault,
+			MaxWorkers:          1_000,
+			Notifier:            nil, // no notifier
+			Queue:               queueName,
+			QueuePollInterval:   queuePollIntervalDefault,
+			QueueReportInterval: queueReportIntervalDefault,
+			RetryPolicy:         &DefaultClientRetryPolicy{},
+			SchedulerInterval:   riverinternaltest.SchedulerShortInterval,
+			Schema:              "",
+			LeaseTTL:            time.Minute,
+			Workers:             NewWorkers(),
 		}), jobUpdates
 	})
 }
@@ -269,24 +269,24 @@ func TestProducer_WithNotifier(t *testing.T) {
 		}
 
 		return newProducer(archetype, exec, pilot, &producerConfig{
-			ClientID:                     testClientID,
-			Completer:                    completer,
-			ErrorHandler:                 newTestErrorHandler(),
-			FetchCooldown:                FetchCooldownDefault,
-			FetchPollInterval:            50 * time.Millisecond, // more aggressive than normal so in case we miss the event, tests still pass quickly
-			PluginLookupByJob:            pluginlookup.NewJobPluginLookup(nil),
-			PluginLookupGlobal:           pluginlookup.NewPluginLookup(nil),
-			JobTimeout:                   JobTimeoutDefault,
-			MaxWorkers:                   1_000,
-			Notifier:                     notifier,
-			Queue:                        queueName,
-			QueuePollInterval:            queuePollIntervalDefault,
-			QueueReportInterval:          queueReportIntervalDefault,
-			RetryPolicy:                  &DefaultClientRetryPolicy{},
-			SchedulerInterval:            riverinternaltest.SchedulerShortInterval,
-			Schema:                       schema,
-			StaleProducerRetentionPeriod: time.Minute,
-			Workers:                      NewWorkers(),
+			ClientID:            testClientID,
+			Completer:           completer,
+			ErrorHandler:        newTestErrorHandler(),
+			FetchCooldown:       FetchCooldownDefault,
+			FetchPollInterval:   50 * time.Millisecond, // more aggressive than normal so in case we miss the event, tests still pass quickly
+			PluginLookupByJob:   pluginlookup.NewJobPluginLookup(nil),
+			PluginLookupGlobal:  pluginlookup.NewPluginLookup(nil),
+			JobTimeout:          JobTimeoutDefault,
+			MaxWorkers:          1_000,
+			Notifier:            notifier,
+			Queue:               queueName,
+			QueuePollInterval:   queuePollIntervalDefault,
+			QueueReportInterval: queueReportIntervalDefault,
+			RetryPolicy:         &DefaultClientRetryPolicy{},
+			SchedulerInterval:   riverinternaltest.SchedulerShortInterval,
+			Schema:              schema,
+			LeaseTTL:            time.Minute,
+			Workers:             NewWorkers(),
 		}), jobUpdates
 	})
 }

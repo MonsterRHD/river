@@ -738,6 +738,7 @@ type clientTestSignals struct {
 	jobRescuer            *maintenance.JobRescuerTestSignals
 	jobScheduler          *maintenance.JobSchedulerTestSignals
 	periodicJobEnqueuer   *maintenance.PeriodicJobEnqueuerTestSignals
+	producerReaper        *maintenance.ProducerReaperTestSignals
 	queueCleaner          *maintenance.QueueCleanerTestSignals
 	queueMaintainerLeader *maintenance.QueueMaintainerLeaderTestSignals
 	reindexer             *maintenance.ReindexerTestSignals
@@ -755,6 +756,9 @@ func (ts *clientTestSignals) Init(tb testutil.TestingTB) {
 	}
 	if ts.periodicJobEnqueuer != nil {
 		ts.periodicJobEnqueuer.Init(tb)
+	}
+	if ts.producerReaper != nil {
+		ts.producerReaper.Init(tb)
 	}
 	if ts.queueCleaner != nil {
 		ts.queueCleaner.Init(tb)
@@ -1002,6 +1006,16 @@ func NewClient[TTx any](driver riverdriver.Driver[TTx], config *Config) (*Client
 
 			client.periodicJobs = newPeriodicJobBundle(client.config, periodicJobEnqueuer)
 			client.periodicJobs.AddMany(config.PeriodicJobs)
+		}
+
+		{
+			producerReaper := maintenance.NewProducerReaper(archetype, &maintenance.ProducerReaperConfig{
+				Interval:              maintenance.ProducerReaperIntervalDefault,
+				ReapedRetentionPeriod: maintenance.ProducerReapedRetentionPeriodDefault,
+				Schema:                config.Schema,
+			}, driver.GetExecutor())
+			maintenanceServices = append(maintenanceServices, producerReaper)
+			client.testSignals.producerReaper = &producerReaper.TestSignals
 		}
 
 		{
@@ -2287,27 +2301,27 @@ func (c *Client[TTx]) producerAdd(queueName string, queueConfig QueueConfig) (*p
 	}
 
 	producer := newProducer(&c.baseService.Archetype, c.driver.GetExecutor(), c.pilot, &producerConfig{
-		ClientID:                     c.config.ID,
-		Completer:                    c.completer,
-		ErrorHandler:                 c.config.ErrorHandler,
-		FetchCooldown:                cmp.Or(queueConfig.FetchCooldown, c.config.FetchCooldown),
-		FetchPollInterval:            cmp.Or(queueConfig.FetchPollInterval, c.config.FetchPollInterval),
-		PluginLookupByJob:            c.pluginLookupByJob,
-		PluginLookupGlobal:           c.pluginLookupGlobal,
-		JobStuckHandler:              c.config.JobStuckHandler,
-		JobStuckCount:                &c.stuckJobCount,
-		JobStuckThreshold:            c.config.JobStuckThreshold,
-		JobTimeout:                   c.config.JobTimeout,
-		MaxWorkers:                   queueConfig.MaxWorkers,
-		Notifier:                     c.notifier,
-		Queue:                        queueName,
-		QueueEventCallback:           c.subscriptionManager.distributeQueueEvent,
-		QueuePollInterval:            c.config.queuePollInterval,
-		RetryPolicy:                  c.config.RetryPolicy,
-		SchedulerInterval:            c.config.schedulerInterval,
-		Schema:                       c.config.Schema,
-		StaleProducerRetentionPeriod: 5 * time.Minute,
-		Workers:                      c.config.Workers,
+		ClientID:           c.config.ID,
+		Completer:          c.completer,
+		ErrorHandler:       c.config.ErrorHandler,
+		FetchCooldown:      cmp.Or(queueConfig.FetchCooldown, c.config.FetchCooldown),
+		FetchPollInterval:  cmp.Or(queueConfig.FetchPollInterval, c.config.FetchPollInterval),
+		PluginLookupByJob:  c.pluginLookupByJob,
+		PluginLookupGlobal: c.pluginLookupGlobal,
+		JobStuckHandler:    c.config.JobStuckHandler,
+		JobStuckCount:      &c.stuckJobCount,
+		JobStuckThreshold:  c.config.JobStuckThreshold,
+		JobTimeout:         c.config.JobTimeout,
+		MaxWorkers:         queueConfig.MaxWorkers,
+		Notifier:           c.notifier,
+		Queue:              queueName,
+		QueueEventCallback: c.subscriptionManager.distributeQueueEvent,
+		QueuePollInterval:  c.config.queuePollInterval,
+		RetryPolicy:        c.config.RetryPolicy,
+		SchedulerInterval:  c.config.schedulerInterval,
+		Schema:             c.config.Schema,
+		LeaseTTL:           producerLeaseTTLDefault,
+		Workers:            c.config.Workers,
 	})
 	c.producersByQueueName[queueName] = producer
 	return producer, nil

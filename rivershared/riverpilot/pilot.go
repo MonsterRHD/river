@@ -167,16 +167,64 @@ type PeriodicJobUpsertParams struct {
 
 type ProducerState interface {
 	JobFinish(job *rivertype.JobRow)
+
+	// ProducerGeneration returns the generation of the lease that ProducerInit
+	// acquired. It's used to fence later lease operations so a stale process
+	// can't act on a newer generation's lease.
+	ProducerGeneration() int64
+}
+
+// ProducerNotificationTopic is the notification topic on which producer
+// lifecycle changes, like a producer going offline, are broadcast.
+const ProducerNotificationTopic = "river_producer"
+
+// ProducerNotificationAction describes the kind of change in a producer
+// lifecycle notification.
+//
+// API is not stable. DO NOT USE.
+type ProducerNotificationAction string
+
+const (
+	// ProducerNotificationActionOffline indicates that a producer's lease is
+	// no longer active, either because it released itself gracefully or because
+	// the leader reaped it after its lease expired.
+	ProducerNotificationActionOffline ProducerNotificationAction = "offline"
+)
+
+// ProducerNotificationPayload is the payload broadcast on
+// ProducerNotificationTopic when a producer lifecycle change occurs.
+//
+// API is not stable. DO NOT USE.
+type ProducerNotificationPayload struct {
+	Action     ProducerNotificationAction `json:"action"`
+	ClientID   string                     `json:"client_id"`
+	Generation int64                      `json:"generation"`
+	ProducerID int64                      `json:"producer_id"`
+	Queue      string                     `json:"queue"`
 }
 
 type ProducerInitParams struct {
 	ClientID   string
 	ProducerID int64
-	Queue      string
-	Schema     string
+
+	// MaxWorkers is the number of workers the producer is running for the
+	// queue, i.e. its declared capacity.
+	MaxWorkers int
+
+	Now *time.Time
+
+	Queue string
+
+	Schema string
+
+	// TTL is the duration for which an acquired or renewed lease is valid
+	// after Now.
+	TTL time.Duration
 }
 
 type ProducerShutdownParams struct {
+	ClientID   string
+	Generation int64
 	ProducerID int64
 	Queue      string
 	Schema     string

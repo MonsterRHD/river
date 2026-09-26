@@ -99,6 +99,18 @@ type RiverNotification struct {
 	Topic     string
 }
 
+type RiverProducer struct {
+	QueueName  string
+	ClientID   string
+	ProducerID int64
+	Generation int64
+	MaxWorkers int64
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
+	ExpiresAt  time.Time
+	ReapedAt   *time.Time
+}
+
 type RiverQueue struct {
 	Name      string
 	CreatedAt time.Time

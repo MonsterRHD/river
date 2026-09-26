@@ -938,6 +938,95 @@ func (e *Executor) PGAdvisoryXactLock(ctx context.Context, key int64) (*struct{}
 	return &struct{}{}, interpretError(err)
 }
 
+func (e *Executor) ProducerDeleteReaped(ctx context.Context, params *riverdriver.ProducerDeleteReapedParams) ([]*riverdriver.Producer, error) {
+	producers, err := dbsqlc.New().ProducerDeleteReaped(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.ProducerDeleteReapedParams{
+		Max:             int64(params.Max),
+		ReapedAtHorizon: params.ReapedAtHorizon,
+	})
+	if err != nil {
+		return nil, interpretError(err)
+	}
+	return sliceutil.Map(producers, producerFromInternal), nil
+}
+
+func (e *Executor) ProducerFinish(ctx context.Context, params *riverdriver.ProducerFinishParams) (*riverdriver.Producer, error) {
+	producer, err := dbsqlc.New().ProducerFinish(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.ProducerFinishParams{
+		ClientID:   params.ClientID,
+		Generation: params.Generation,
+		Now:        params.Now,
+		QueueName:  params.QueueName,
+	})
+	if err != nil {
+		return nil, interpretError(err)
+	}
+	return producerFromInternal(producer), nil
+}
+
+func (e *Executor) ProducerGet(ctx context.Context, params *riverdriver.ProducerGetParams) (*riverdriver.Producer, error) {
+	producer, err := dbsqlc.New().ProducerGet(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.ProducerGetParams{
+		ClientID:  params.ClientID,
+		QueueName: params.QueueName,
+	})
+	if err != nil {
+		return nil, interpretError(err)
+	}
+	return producerFromInternal(producer), nil
+}
+
+func (e *Executor) ProducerInsert(ctx context.Context, params *riverdriver.ProducerInsertParams) (*riverdriver.Producer, error) {
+	producer, err := dbsqlc.New().ProducerInsert(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.ProducerInsertParams{
+		ClientID:   params.ClientID,
+		MaxWorkers: int64(params.MaxWorkers),
+		Now:        params.Now,
+		ProducerID: params.ProducerID,
+		QueueName:  params.QueueName,
+		TTL:        params.TTL.Seconds(),
+	})
+	if err != nil {
+		return nil, interpretError(err)
+	}
+	return producerFromInternal(producer), nil
+}
+
+func (e *Executor) ProducerKeepAlive(ctx context.Context, params *riverdriver.ProducerKeepAliveParams) (*riverdriver.Producer, error) {
+	producer, err := dbsqlc.New().ProducerKeepAlive(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.ProducerKeepAliveParams{
+		ClientID:   params.ClientID,
+		Generation: params.Generation,
+		Now:        params.Now,
+		QueueName:  params.QueueName,
+		TTL:        params.TTL.Seconds(),
+	})
+	if err != nil {
+		return nil, interpretError(err)
+	}
+	return producerFromInternal(producer), nil
+}
+
+func (e *Executor) ProducerReapExpired(ctx context.Context, params *riverdriver.ProducerReapExpiredParams) ([]*riverdriver.Producer, error) {
+	producers, err := dbsqlc.New().ProducerReapExpired(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.ProducerReapExpiredParams{
+		Max: int64(params.Max),
+		Now: params.Now,
+	})
+	if err != nil {
+		return nil, interpretError(err)
+	}
+	return sliceutil.Map(producers, producerFromInternal), nil
+}
+
+func producerFromInternal(internal *dbsqlc.RiverProducer) *riverdriver.Producer {
+	return &riverdriver.Producer{
+		ClientID:   internal.ClientID,
+		QueueName:  internal.QueueName,
+		ProducerID: internal.ProducerID,
+		Generation: internal.Generation,
+		MaxWorkers: internal.MaxWorkers,
+		CreatedAt:  internal.CreatedAt,
+		UpdatedAt:  internal.UpdatedAt,
+		ExpiresAt:  internal.ExpiresAt,
+		ReapedAt:   internal.ReapedAt,
+	}
+}
+
 func (e *Executor) QueueCreateOrSetUpdatedAt(ctx context.Context, params *riverdriver.QueueCreateOrSetUpdatedAtParams) (*rivertype.Queue, error) {
 	queue, err := dbsqlc.New().QueueCreateOrSetUpdatedAt(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.QueueCreateOrSetUpdatedAtParams{
 		Metadata:  cmp.Or(string(params.Metadata), "{}"),

@@ -7,6 +7,7 @@ sql:
       - ../../../riverpgxv5/internal/dbsqlc/river_leader.sql
       - ../../../riverpgxv5/internal/dbsqlc/river_migration.sql
       - ../../../riverpgxv5/internal/dbsqlc/river_notification.sql
+      - ../../../riverpgxv5/internal/dbsqlc/river_producer.sql
       - ../../../riverpgxv5/internal/dbsqlc/river_queue.sql
       - ../../../riverpgxv5/internal/dbsqlc/schema.sql
     schema:
@@ -15,6 +16,7 @@ sql:
       - ../../../riverpgxv5/internal/dbsqlc/river_leader.sql
       - ../../../riverpgxv5/internal/dbsqlc/river_migration.sql
       - ../../../riverpgxv5/internal/dbsqlc/river_notification.sql
+      - ../../../riverpgxv5/internal/dbsqlc/river_producer.sql
       - ../../../riverpgxv5/internal/dbsqlc/river_queue.sql
       - ../../../riverpgxv5/internal/dbsqlc/schema.sql
     gen:

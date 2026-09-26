@@ -35,6 +35,7 @@ import (
 )
 
 const (
+	producerLeaseTTLDefault       = 5 * time.Minute
 	producerReportIntervalDefault = 30 * time.Second
 	queuePollIntervalDefault      = 2 * time.Second
 	queueReportIntervalDefault    = 10 * time.Minute
@@ -44,6 +45,7 @@ const (
 type producerTestSignals struct {
 	DeletedExpiredQueueRecords testsignal.TestSignal[struct{}]             // notifies when the producer deletes expired queue records
 	JobFetchTriggered          testsignal.TestSignal[struct{}]             // notifies when the producer's fetch limiter is triggered via triggerJobFetch
+	LeaseLost                  testsignal.TestSignal[struct{}]             // notifies when the producer's lease is lost to a newer generation
 	MetadataChanged            testsignal.TestSignal[struct{}]             // notifies when the producer detects a metadata change
 	Paused                     testsignal.TestSignal[struct{}]             // notifies when the producer is paused
 	PolledQueueConfig          testsignal.TestSignal[struct{}]             // notifies when the producer polls for queue settings
@@ -57,6 +59,7 @@ type producerTestSignals struct {
 func (ts *producerTestSignals) Init(tb testutil.TestingTB) {
 	ts.DeletedExpiredQueueRecords.Init(tb)
 	ts.JobFetchTriggered.Init(tb)
+	ts.LeaseLost.Init(tb)
 	ts.MetadataChanged.Init(tb)
 	ts.Paused.Init(tb)
 	ts.PolledQueueConfig.Init(tb)
@@ -109,12 +112,16 @@ type producerConfig struct {
 	QueuePollInterval time.Duration
 	// QueueReportInterval is the amount of time between periodic reports
 	// of the queue status.
-	QueueReportInterval          time.Duration
-	RetryPolicy                  ClientRetryPolicy
-	SchedulerInterval            time.Duration
-	Schema                       string
-	StaleProducerRetentionPeriod time.Duration
-	Workers                      *Workers
+	QueueReportInterval time.Duration
+	// LeaseTTL is the duration for which the producer's database lease remains
+	// valid after each acquisition or keepalive. The leader's producer reaper
+	// reaps the lease after this much time passes without a successful
+	// keepalive.
+	LeaseTTL          time.Duration
+	RetryPolicy       ClientRetryPolicy
+	SchedulerInterval time.Duration
+	Schema            string
+	Workers           *Workers
 }
 
 func (c *producerConfig) mustValidate() *producerConfig {
@@ -169,8 +176,8 @@ func (c *producerConfig) mustValidate() *producerConfig {
 	if c.SchedulerInterval == 0 {
 		panic("producerConfig.SchedulerInterval is required")
 	}
-	if c.StaleProducerRetentionPeriod <= 0 {
-		panic("producerConfig.StaleProducerRetentionPeriod must be greater than zero")
+	if c.LeaseTTL <= 0 {
+		panic("producerConfig.LeaseTTL must be greater than zero")
 	}
 	if c.Workers == nil {
 		panic("producerConfig.Workers is required")
@@ -196,11 +203,15 @@ type producer struct {
 	completer       jobcompleter.JobCompleter
 	config          *producerConfig
 	id              atomic.Int64 // atomic because it's written at startup and read during shutdown
+	generation      atomic.Int64 // fencing generation of the held lease; atomic because the keepalive loop may re-acquire after recovery
 	exec            riverdriver.Executor
 	errorHandler    jobexecutor.ErrorHandler
 	fetchLimiter    *chanutil.DebouncedChan
+	leaseLostCh     chan struct{} // closed once when this producer has lost its lease to a newer generation
+	leaseLostOnce   sync.Once
 	metricEmitHooks []rivertype.HookMetricEmit // memoized hooks of type HookMetricEmit for reuse in dispatchWork
 	state           riverpilot.ProducerState
+	stateMu         sync.RWMutex // guards state, which is swapped if a lease is re-acquired after recovery
 	pilot           riverpilot.Pilot
 	workers         *Workers
 
@@ -255,6 +266,7 @@ func newProducer(archetype *baseservice.Archetype, exec riverdriver.Executor, pi
 		errorHandler:   errorHandler,
 		jobResultCh:    make(chan *rivertype.JobRow, config.MaxWorkers),
 		jobTimeout:     config.JobTimeout,
+		leaseLostCh:    make(chan struct{}, 1),
 		pilot:          pilot,
 		queueControlCh: make(chan *controlEventPayload, 100),
 		retryPolicy:    config.RetryPolicy,
@@ -332,11 +344,15 @@ func (p *producer) StartWorkContext(fetchCtx, workCtx context.Context) error {
 	p.paused = initiallyPaused
 
 	id := p.id.Load()
-	id, p.state, err = p.pilot.ProducerInit(fetchCtx, p.exec, &riverpilot.ProducerInitParams{
+	var state riverpilot.ProducerState
+	id, state, err = p.pilot.ProducerInit(fetchCtx, p.exec, &riverpilot.ProducerInitParams{
 		ClientID:   p.config.ClientID,
+		MaxWorkers: p.config.MaxWorkers,
+		Now:        p.Time.NowOrNil(),
 		ProducerID: id,
 		Queue:      p.config.Queue,
 		Schema:     p.config.Schema,
+		TTL:        p.config.LeaseTTL,
 	})
 	if err != nil {
 		stopped()
@@ -347,6 +363,8 @@ func (p *producer) StartWorkContext(fetchCtx, workCtx context.Context) error {
 		return err
 	}
 	p.id.Store(id)
+	p.setProducerState(state)
+	p.generation.Store(state.ProducerGeneration())
 
 	p.fetchLimiter = chanutil.NewDebouncedChan(fetchCtx, p.config.FetchCooldown, true)
 
@@ -539,6 +557,13 @@ func (p *producer) fetchAndRunLoop(fetchCtx, workCtx context.Context) {
 		select {
 		case <-fetchCtx.Done():
 			return
+		case <-p.leaseLostCh:
+			// A newer generation has taken this producer's slot. Stop
+			// fetching new jobs and drain anything in flight rather than risk
+			// working in parallel with the lease owner.
+			p.Logger.ErrorContext(workCtx, p.Name+": Producer lease lost to a newer generation; stopping fetch",
+				slog.String("queue", p.config.Queue), slog.Int64("generation", p.generation.Load()))
+			return
 		case msg := <-p.queueControlCh:
 			switch msg.Action {
 			case controlActionCancel:
@@ -697,6 +722,8 @@ func (p *producer) finalizeShutdown(ctx context.Context) {
 	attemptShutdown := func(timeout time.Duration) error {
 		return timeoututil.WithTimeout(ctx, timeout, p.Name+".finalizeShutdown", func(ctx context.Context) error {
 			if err := p.pilot.ProducerShutdown(ctx, p.exec, &riverpilot.ProducerShutdownParams{
+				ClientID:   p.config.ClientID,
+				Generation: p.generation.Load(),
 				ProducerID: p.id.Load(),
 				Queue:      p.config.Queue,
 				Schema:     p.config.Schema,
@@ -748,7 +775,7 @@ func (p *producer) removeActiveJob(job *rivertype.JobRow) {
 		p.numJobsActive.Add(-1)
 	}
 	p.numJobsRan.Add(1)
-	p.state.JobFinish(job)
+	p.producerState().JobFinish(job)
 }
 
 func (p *producer) handleWorkerStuck(ctx context.Context, executor *jobexecutor.JobExecutor, job *rivertype.JobRow) {
@@ -833,7 +860,7 @@ func (p *producer) dispatchWork(workCtx context.Context, count int, fetchResultC
 		startedAt = time.Now()
 	}
 
-	jobs, err := p.pilot.JobGetAvailable(ctx, p.exec, p.state, &riverdriver.JobGetAvailableParams{
+	jobs, err := p.pilot.JobGetAvailable(ctx, p.exec, p.producerState(), &riverdriver.JobGetAvailableParams{
 		ClientID:       p.config.ClientID,
 		MaxAttemptedBy: maxAttemptedBy,
 		MaxToLock:      count,
@@ -1056,28 +1083,155 @@ func (p *producer) reportProducerStatusLoop(ctx context.Context, wg *sync.WaitGr
 	}
 }
 
+// leaseReconcileOutcome describes what the producer determined when it
+// re-reads its lease from persistent state after a keepalive failed to match
+// the row.
+type leaseReconcileOutcome int
+
+const (
+	// leaseReconcileRetried means the persistent row is still the current
+	// generation and active, so the missed keepalive was transient; another
+	// renewal should be attempted on the next interval.
+	leaseReconcileRetried leaseReconcileOutcome = iota
+
+	// leaseReconcileReacquired means the row was missing or had been reaped
+	// after expiry, and the producer re-acquired a new generation and may keep
+	// working.
+	leaseReconcileReacquired
+
+	// leaseReconcileSuperseded means a newer generation now owns the slot.
+	// This producer must stop fetching new jobs.
+	leaseReconcileSuperseded
+)
+
+func (p *producer) producerState() riverpilot.ProducerState {
+	p.stateMu.RLock()
+	defer p.stateMu.RUnlock()
+
+	return p.state
+}
+
+func (p *producer) setProducerState(state riverpilot.ProducerState) {
+	p.stateMu.Lock()
+	defer p.stateMu.Unlock()
+
+	p.state = state
+}
+
 func (p *producer) reportProducerStatusOnce(ctx context.Context) {
 	err := timeoututil.WithTimeout(ctx, 10*time.Second, p.Name+".reportProducerStatusOnce", func(ctx context.Context) error {
-		p.Logger.DebugContext(ctx, p.Name+": Reporting producer status", slog.Int64("id", p.id.Load()), slog.String("queue", p.config.Queue))
+		p.Logger.DebugContext(ctx, p.Name+": Renewing producer lease",
+			slog.Int64("id", p.id.Load()),
+			slog.String("queue", p.config.Queue),
+			slog.Int64("generation", p.generation.Load()))
 		return p.pilot.ProducerKeepAlive(ctx, p.exec, &riverdriver.ProducerKeepAliveParams{
-			ID:                    p.id.Load(),
-			QueueName:             p.config.Queue,
-			Schema:                p.config.Schema,
-			StaleUpdatedAtHorizon: p.Time.Now().Add(-p.config.StaleProducerRetentionPeriod),
+			ClientID:   p.config.ClientID,
+			Generation: p.generation.Load(),
+			Now:        p.Time.NowOrNil(),
+			QueueName:  p.config.Queue,
+			Schema:     p.config.Schema,
+			TTL:        p.config.LeaseTTL,
 		})
 	})
 	if err != nil && errors.Is(context.Cause(ctx), startstop.ErrStop) {
 		return
 	}
-	if err != nil {
-		p.Logger.ErrorContext(ctx, p.Name+": Producer status update, error updating in database",
+	if err == nil {
+		p.testSignals.ReportedProducerStatus.Signal(struct{}{})
+		return
+	}
+
+	// The durable row, not in-memory state, decides what happens next: a
+	// non-matching renewal is either a transient database problem, a lease
+	// that was reaped after expiry, or a slot taken by a newer generation.
+	if !errors.Is(err, rivertype.ErrNotFound) {
+		p.Logger.ErrorContext(ctx, p.Name+": Producer lease renewal failed; will retry on next interval",
 			slog.Int64("id", p.id.Load()),
 			slog.String("queue", p.config.Queue),
+			slog.Int64("generation", p.generation.Load()),
 			slog.String("err", err.Error()),
 		)
 		return
 	}
-	p.testSignals.ReportedProducerStatus.Signal(struct{}{})
+
+	outcome, reconcileErr := p.reconcileLease(ctx)
+	if reconcileErr != nil {
+		p.Logger.ErrorContext(ctx, p.Name+": Error recovering producer lease from persistent state",
+			slog.String("queue", p.config.Queue),
+			slog.String("err", reconcileErr.Error()),
+		)
+		return
+	}
+
+	switch outcome {
+	case leaseReconcileRetried:
+		p.Logger.WarnContext(ctx, p.Name+": Producer lease renewal missed, but persistent lease is still current; retrying",
+			slog.String("queue", p.config.Queue), slog.Int64("generation", p.generation.Load()))
+	case leaseReconcileReacquired:
+		p.Logger.WarnContext(ctx, p.Name+": Reacquired producer lease after the previous lease was reaped",
+			slog.String("queue", p.config.Queue), slog.Int64("generation", p.generation.Load()))
+		p.testSignals.ReportedProducerStatus.Signal(struct{}{})
+	case leaseReconcileSuperseded:
+		p.Logger.ErrorContext(ctx, p.Name+": Producer lease lost to a newer generation; stopping fetch",
+			slog.String("queue", p.config.Queue), slog.Int64("generation", p.generation.Load()))
+		p.leaseLostOnce.Do(func() {
+			p.testSignals.LeaseLost.Signal(struct{}{})
+			p.leaseLostCh <- struct{}{}
+		})
+	}
+}
+
+// reconcileLease reads the current lease row from persistent state and either
+// reacquires the lease (row missing or reaped after expiry), marks this
+// producer as superseded (a newer generation owns the slot), or indicates that
+// renewal should simply be retried (row is still the current generation).
+func (p *producer) reconcileLease(ctx context.Context) (leaseReconcileOutcome, error) {
+	var outcome leaseReconcileOutcome
+
+	err := timeoututil.WithTimeout(ctx, 10*time.Second, p.Name+".reconcileLease", func(ctx context.Context) error {
+		current, err := p.exec.ProducerGet(ctx, &riverdriver.ProducerGetParams{
+			ClientID:  p.config.ClientID,
+			QueueName: p.config.Queue,
+			Schema:    p.config.Schema,
+		})
+		if err != nil && !errors.Is(err, rivertype.ErrNotFound) {
+			return err
+		}
+
+		switch {
+		case err == nil && current.Generation > p.generation.Load():
+			outcome = leaseReconcileSuperseded
+			return nil
+		case err == nil && current.Generation == p.generation.Load() && current.ReapedAt == nil:
+			outcome = leaseReconcileRetried
+			return nil
+		}
+
+		// Row is missing or has already been reaped: acquire a fresh
+		// generation and keep working.
+		id, state, err := p.pilot.ProducerInit(ctx, p.exec, &riverpilot.ProducerInitParams{
+			ClientID:   p.config.ClientID,
+			MaxWorkers: p.config.MaxWorkers,
+			Now:        p.Time.NowOrNil(),
+			ProducerID: p.id.Load(),
+			Queue:      p.config.Queue,
+			Schema:     p.config.Schema,
+			TTL:        p.config.LeaseTTL,
+		})
+		if err != nil {
+			return err
+		}
+		p.id.Store(id)
+		p.setProducerState(state)
+		p.generation.Store(state.ProducerGeneration())
+		outcome = leaseReconcileReacquired
+		return nil
+	})
+	if err != nil {
+		return leaseReconcileRetried, err
+	}
+
+	return outcome, nil
 }
 
 func (p *producer) reportQueueStatusLoop(ctx context.Context, wg *sync.WaitGroup) {

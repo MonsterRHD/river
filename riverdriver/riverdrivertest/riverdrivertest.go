@@ -43,6 +43,7 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 	exerciseJobUpdate(ctx, t, executorWithTx)
 	exerciseJobDelete(ctx, t, executorWithTx)
 	exerciseLeader(ctx, t, executorWithTx)
+	exerciseProducer(ctx, t, executorWithTx)
 	exerciseQueue(ctx, t, executorWithTx)
 }
 
