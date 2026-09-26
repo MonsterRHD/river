@@ -12,22 +12,22 @@
   {
     "id": 3,
     "passed": false,
-    "reason": "PostgreSQL 连接拒绝使持久化恢复用例未执行。"
+    "reason": "数据库连接被拒绝使持久化恢复用例未执行。"
   },
   {
     "id": 4,
     "passed": false,
-    "reason": "PostgreSQL 连接拒绝使归零完成事件用例未执行。"
+    "reason": "数据库连接被拒绝使归零完成事件用例未执行。"
   },
   {
     "id": 5,
     "passed": false,
-    "reason": "PostgreSQL 连接拒绝使领导者接管用例未执行。"
+    "reason": "数据库连接被拒绝使领导者接管用例未执行。"
   },
   {
     "id": 6,
     "passed": false,
-    "reason": "PostgreSQL 连接拒绝使通知丢失与等待超时用例未执行。"
+    "reason": "数据库连接被拒绝使通知丢失与等待超时用例未执行。"
   },
   {
     "id": 7,
