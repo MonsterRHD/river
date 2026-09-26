@@ -461,6 +461,12 @@ type Config struct {
 	// finish in a timely manner.
 	queuePollInterval time.Duration
 
+	// queueSettingPollInterval is the amount of time between fallback checks
+	// for queue setting changes (including drain state) when a notifier is
+	// configured. Notifications drive convergence normally; this poll is a
+	// hedge against lost notifications.
+	queueSettingPollInterval time.Duration
+
 	// Scheduler run interval. Shared between the scheduler and producer/job
 	// executors, but not currently exposed for configuration.
 	schedulerInterval time.Duration
@@ -543,6 +549,7 @@ func (c *Config) WithDefaults() *Config {
 		WorkerMiddleware:            c.WorkerMiddleware,
 		Workers:                     c.Workers,
 		queuePollInterval:           c.queuePollInterval,
+		queueSettingPollInterval:    cmp.Or(c.queueSettingPollInterval, queueSettingPollIntervalNotifyModeDefault),
 		schedulerInterval:           cmp.Or(c.schedulerInterval, maintenance.JobSchedulerIntervalDefault),
 	}
 }
@@ -2303,7 +2310,9 @@ func (c *Client[TTx]) producerAdd(queueName string, queueConfig QueueConfig) (*p
 		Queue:                        queueName,
 		QueueEventCallback:           c.subscriptionManager.distributeQueueEvent,
 		QueuePollInterval:            c.config.queuePollInterval,
+		QueueSettingPollInterval:     c.config.queueSettingPollInterval,
 		RetryPolicy:                  c.config.RetryPolicy,
+		SupportsListenNotify:         c.driver.SupportsListenNotify(),
 		SchedulerInterval:            c.config.schedulerInterval,
 		Schema:                       c.config.Schema,
 		StaleProducerRetentionPeriod: 5 * time.Minute,

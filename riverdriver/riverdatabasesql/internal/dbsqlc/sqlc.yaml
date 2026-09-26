@@ -8,6 +8,7 @@ sql:
       - ../../../riverpgxv5/internal/dbsqlc/river_migration.sql
       - ../../../riverpgxv5/internal/dbsqlc/river_notification.sql
       - ../../../riverpgxv5/internal/dbsqlc/river_queue.sql
+      - ../../../riverpgxv5/internal/dbsqlc/river_queue_drain.sql
       - ../../../riverpgxv5/internal/dbsqlc/schema.sql
     schema:
       - ../../../riverpgxv5/internal/dbsqlc/pg_misc.sql
@@ -16,6 +17,7 @@ sql:
       - ../../../riverpgxv5/internal/dbsqlc/river_migration.sql
       - ../../../riverpgxv5/internal/dbsqlc/river_notification.sql
       - ../../../riverpgxv5/internal/dbsqlc/river_queue.sql
+      - ../../../riverpgxv5/internal/dbsqlc/river_queue_drain.sql
       - ../../../riverpgxv5/internal/dbsqlc/schema.sql
     gen:
       go:

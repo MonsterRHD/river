@@ -153,6 +153,77 @@ func TestQueueCleaner(t *testing.T) {
 		}
 	})
 
+	t.Run("DeletesResumedDrains", func(t *testing.T) {
+		t.Parallel()
+
+		_, bundle := setup(t)
+
+		cleaner := NewQueueCleaner(
+			riversharedtest.BaseServiceArchetype(t),
+			&QueueCleanerConfig{
+				Interval:        queueCleanerIntervalDefault,
+				RetentionPeriod: 24 * time.Hour,
+			},
+			bundle.exec)
+		cleaner.StaggerStartupDisable(true)
+		cleaner.TestSignals.Init(t)
+
+		oldTime := time.Now().UTC().Add(-25 * time.Hour)
+		recentTime := time.Now().UTC()
+
+		insertResumedDrain := func(queue string, updatedAt time.Time) {
+			_, err := bundle.exec.QueueDrainInsert(ctx, &riverdriver.QueueDrainInsertParams{
+				Key:   "key-" + queue,
+				Now:   &oldTime,
+				Queue: queue,
+			})
+			require.NoError(t, err)
+			_, err = bundle.exec.QueueDrainComplete(ctx, &riverdriver.QueueDrainCompleteParams{
+				Now:   &oldTime,
+				Queue: queue,
+			})
+			require.NoError(t, err)
+			_, err = bundle.exec.QueueDrainResume(ctx, &riverdriver.QueueDrainResumeParams{
+				Now:   &updatedAt,
+				Queue: queue,
+			})
+			require.NoError(t, err)
+		}
+
+		insertResumedDrain("drain_clean_old", oldTime)
+		insertResumedDrain("drain_clean_recent", recentTime)
+
+		// An active drain survives the cleanup regardless of its timestamps.
+		_, err := bundle.exec.QueueDrainInsert(ctx, &riverdriver.QueueDrainInsertParams{
+			Key:   "key-active",
+			Now:   &oldTime,
+			Queue: "drain_clean_active",
+		})
+		require.NoError(t, err)
+
+		_, err = cleaner.runOnce(ctx)
+		require.NoError(t, err)
+
+		_, err = bundle.exec.QueueDrainGetByKey(ctx, &riverdriver.QueueDrainGetByKeyParams{
+			Key:   "key-drain_clean_old",
+			Queue: "drain_clean_old",
+		})
+		require.ErrorIs(t, err, rivertype.ErrNotFound)
+
+		recent, err := bundle.exec.QueueDrainGetByKey(ctx, &riverdriver.QueueDrainGetByKeyParams{
+			Key:   "key-drain_clean_recent",
+			Queue: "drain_clean_recent",
+		})
+		require.NoError(t, err)
+		require.Equal(t, riverdriver.QueueDrainStateResumed, recent.State)
+
+		active, err := bundle.exec.QueueDrainGetActive(ctx, &riverdriver.QueueDrainGetParams{
+			Queue: "drain_clean_active",
+		})
+		require.NoError(t, err)
+		require.Equal(t, riverdriver.QueueDrainStateDraining, active.State)
+	})
+
 	t.Run("CustomizableInterval", func(t *testing.T) {
 		t.Parallel()
 

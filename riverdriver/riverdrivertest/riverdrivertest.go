@@ -44,6 +44,7 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 	exerciseJobDelete(ctx, t, executorWithTx)
 	exerciseLeader(ctx, t, executorWithTx)
 	exerciseQueue(ctx, t, executorWithTx)
+	exerciseQueueDrain(ctx, t, executorWithTx)
 }
 
 const testClientID = "test-client-id"

@@ -31,6 +31,20 @@ const (
 	// EventKindJobSnoozed occurs when a job is snoozed.
 	EventKindJobSnoozed EventKind = "job_snoozed"
 
+	// EventKindQueueDrainStarted occurs when a drain (handoff) starts for a
+	// queue. After this event, clients stop fetching new jobs for the queue
+	// while already running jobs finish.
+	EventKindQueueDrainStarted EventKind = "queue_drain_started"
+
+	// EventKindQueueDrained occurs when a queue's drain completes, meaning its
+	// running job count reached zero. The queue remains gated for fetching
+	// until explicitly resumed.
+	EventKindQueueDrained EventKind = "queue_drained"
+
+	// EventKindQueueDrainResumed occurs when a drained queue is explicitly
+	// resumed and clients resume fetching new jobs for it.
+	EventKindQueueDrainResumed EventKind = "queue_drain_resumed"
+
 	// EventKindQueuePaused occurs when a queue is paused.
 	EventKindQueuePaused EventKind = "queue_paused"
 
@@ -42,18 +56,25 @@ const (
 // exported because end users should have no way of subscribing to all known
 // kinds for forward compatibility reasons.
 var allKinds = map[EventKind]struct{}{ //nolint:gochecknoglobals
-	EventKindJobCancelled:   {},
-	EventKindJobCompleted:   {},
-	EventKindJobFailed:      {},
-	EventKindJobInterrupted: {},
-	EventKindJobSnoozed:     {},
-	EventKindQueuePaused:    {},
-	EventKindQueueResumed:   {},
+	EventKindJobCancelled:      {},
+	EventKindJobCompleted:      {},
+	EventKindJobFailed:         {},
+	EventKindJobInterrupted:    {},
+	EventKindJobSnoozed:        {},
+	EventKindQueueDrainStarted: {},
+	EventKindQueueDrained:      {},
+	EventKindQueueDrainResumed: {},
+	EventKindQueuePaused:       {},
+	EventKindQueueResumed:      {},
 }
 
 // Event wraps an event that occurred within a River client, like a job being
 // completed.
 type Event struct {
+	// DrainKey is the stable idempotency key of the drain (handoff) this event
+	// relates to. It's only set for queue drain event kinds.
+	DrainKey string
+
 	// Kind is the kind of event. Receivers should read this field and respond
 	// accordingly. Subscriptions will only receive event kinds that they
 	// requested when creating a subscription with Subscribe.

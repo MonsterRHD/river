@@ -26,6 +26,7 @@ import (
 	"github.com/riverqueue/river/rivershared/riverpilot"
 	"github.com/riverqueue/river/rivershared/startstop"
 	"github.com/riverqueue/river/rivershared/testsignal"
+	"github.com/riverqueue/river/rivershared/util/dbutil"
 	"github.com/riverqueue/river/rivershared/util/randutil"
 	"github.com/riverqueue/river/rivershared/util/serviceutil"
 	"github.com/riverqueue/river/rivershared/util/testutil"
@@ -35,14 +36,18 @@ import (
 )
 
 const (
-	producerReportIntervalDefault = 30 * time.Second
-	queuePollIntervalDefault      = 2 * time.Second
-	queueReportIntervalDefault    = 10 * time.Minute
+	producerReportIntervalDefault             = 30 * time.Second
+	queuePollIntervalDefault                  = 2 * time.Second
+	queueReportIntervalDefault                = 10 * time.Minute
+	queueSettingPollIntervalNotifyModeDefault = 30 * time.Second
 )
 
 // Test-only properties.
 type producerTestSignals struct {
 	DeletedExpiredQueueRecords testsignal.TestSignal[struct{}]             // notifies when the producer deletes expired queue records
+	DrainCompleted             testsignal.TestSignal[struct{}]             // notifies when the producer observes/enters a drained state
+	DrainStarted               testsignal.TestSignal[struct{}]             // notifies when the producer observes/enters a draining state
+	DrainResumed               testsignal.TestSignal[struct{}]             // notifies when the producer observes a drain resume
 	JobFetchTriggered          testsignal.TestSignal[struct{}]             // notifies when the producer's fetch limiter is triggered via triggerJobFetch
 	MetadataChanged            testsignal.TestSignal[struct{}]             // notifies when the producer detects a metadata change
 	Paused                     testsignal.TestSignal[struct{}]             // notifies when the producer is paused
@@ -52,10 +57,14 @@ type producerTestSignals struct {
 	ReportedQueueStatus        testsignal.TestSignal[struct{}]             // notifies when the producer reports queue status
 	Resumed                    testsignal.TestSignal[struct{}]             // notifies when the producer is resumed
 	StartedExecutors           testsignal.TestSignal[struct{}]             // notifies when runOnce finishes a pass
+	TriedCompleteDrain         testsignal.TestSignal[struct{}]             // notifies when the producer makes a conditional drain completion attempt
 }
 
 func (ts *producerTestSignals) Init(tb testutil.TestingTB) {
 	ts.DeletedExpiredQueueRecords.Init(tb)
+	ts.DrainCompleted.Init(tb)
+	ts.DrainStarted.Init(tb)
+	ts.DrainResumed.Init(tb)
 	ts.JobFetchTriggered.Init(tb)
 	ts.MetadataChanged.Init(tb)
 	ts.Paused.Init(tb)
@@ -65,6 +74,7 @@ func (ts *producerTestSignals) Init(tb testutil.TestingTB) {
 	ts.ReportedProducerStatus.Init(tb)
 	ts.Resumed.Init(tb)
 	ts.StartedExecutors.Init(tb)
+	ts.TriedCompleteDrain.Init(tb)
 }
 
 type producerConfig struct {
@@ -104,12 +114,26 @@ type producerConfig struct {
 	QueueEventCallback func(event *Event)
 
 	// QueuePollInterval is the amount of time between periodic checks for
-	// queue setting changes. This is only used in poll-only mode (when no
-	// notifier is provided).
+	// queue setting changes when running in poll-only mode (no notifier
+	// configured).
 	QueuePollInterval time.Duration
+
+	// QueueSettingPollInterval is the amount of time between periodic checks
+	// for queue setting changes when a notifier is configured. It's a fallback
+	// for lost notifications, so it's allowed to be much longer than
+	// QueuePollInterval.
+	QueueSettingPollInterval time.Duration
+
 	// QueueReportInterval is the amount of time between periodic reports
 	// of the queue status.
-	QueueReportInterval          time.Duration
+	QueueReportInterval time.Duration
+
+	// SupportsListenNotify indicates whether the driver broadcasts
+	// notifications that listeners on other clients can receive. When false,
+	// drain completion attempts skip NotifyMany and rely on polling/local
+	// event injection instead.
+	SupportsListenNotify bool
+
 	RetryPolicy                  ClientRetryPolicy
 	SchedulerInterval            time.Duration
 	Schema                       string
@@ -156,6 +180,12 @@ func (c *producerConfig) mustValidate() *producerConfig {
 	}
 	if c.QueuePollInterval <= 0 {
 		panic("producerConfig.QueueSettingsPollInterval must be greater than zero")
+	}
+	if c.QueueSettingPollInterval == 0 {
+		c.QueueSettingPollInterval = queueSettingPollIntervalNotifyModeDefault
+	}
+	if c.QueueSettingPollInterval <= 0 {
+		panic("producerConfig.QueueSettingPollInterval must be greater than zero")
 	}
 	if c.QueueReportInterval == 0 {
 		c.QueueReportInterval = queueReportIntervalDefault
@@ -226,6 +256,12 @@ type producer struct {
 
 	numJobsRan atomic.Uint64
 	paused     bool
+
+	// Local drain (handoff) state. Only ever read or written from the
+	// fetchAndRunLoop goroutine.
+	drainKey   string
+	drainState queueDrainState
+
 	// Receives control messages from the notifier goroutine. Written by notifier
 	// goroutine, only read from main goroutine.
 	queueControlCh chan *controlEventPayload
@@ -331,6 +367,17 @@ func (p *producer) StartWorkContext(fetchCtx, workCtx context.Context) error {
 	}
 	p.paused = initiallyPaused
 
+	initialDrainSnapshot := p.fetchInitialDrainState(fetchCtx)
+	if initialDrainSnapshot != nil {
+		p.drainKey = initialDrainSnapshot.key
+		p.drainState = initialDrainSnapshot.state
+		p.Logger.DebugContext(fetchCtx, p.Name+": Queue drain already active at startup",
+			slog.String("queue", p.config.Queue),
+			slog.String("key", p.drainKey),
+			slog.String("state", string(p.drainState)),
+		)
+	}
+
 	id := p.id.Load()
 	id, p.state, err = p.pilot.ProducerInit(fetchCtx, p.exec, &riverpilot.ProducerInitParams{
 		ClientID:   p.config.ClientID,
@@ -422,14 +469,18 @@ func (p *producer) StartWorkContext(fetchCtx, workCtx context.Context) error {
 
 		if p.config.Notifier == nil {
 			p.Logger.DebugContext(subroutineCtx, p.Name+": No notifier configured; starting in poll mode", "client_id", p.config.ClientID)
-
-			subroutineWG.Add(1)
-			go p.pollForSettingChanges(subroutineCtx, &subroutineWG, initiallyPaused, initialMetadata)
 		}
+
+		// The setting poll runs regardless of notifier availability. In
+		// poll-only mode it's the primary convergence path; with a notifier
+		// it's a slower fallback for lost notifications (including drain
+		// state transitions).
+		subroutineWG.Add(1)
+		go p.pollForSettingChanges(subroutineCtx, &subroutineWG, initiallyPaused, initialMetadata, initialDrainSnapshot)
 
 		p.fetchAndRunLoop(fetchCtx, workCtx)
 		p.Logger.DebugContext(workCtx, p.Name+": Entering shutdown loop", slog.String("queue", p.config.Queue), slog.Int64("id", p.id.Load()))
-		p.executorShutdownLoop()
+		p.executorShutdownLoop(workCtx)
 
 		p.Logger.DebugContext(workCtx, p.Name+": Shutdown loop exited, awaiting subroutines", slog.String("queue", p.config.Queue), slog.Int64("id", p.id.Load()))
 		cancelSubroutines(fmt.Errorf("producer stopped: %w", startstop.ErrStop))
@@ -468,6 +519,9 @@ type controlAction string
 
 const (
 	controlActionCancel          controlAction = "cancel"
+	controlActionDrain           controlAction = "drain"
+	controlActionDrainCompleted  controlAction = "drain_completed"
+	controlActionDrainResume     controlAction = "drain_resume"
 	controlActionMetadataChanged controlAction = "metadata_changed"
 	controlActionPause           controlAction = "pause"
 	controlActionResume          controlAction = "resume"
@@ -476,12 +530,38 @@ const (
 type controlEventPayload struct {
 	Action   controlAction   `json:"action"`
 	JobID    int64           `json:"job_id,omitempty"`
+	Key      string          `json:"key,omitempty"`
 	Metadata json.RawMessage `json:"metadata,omitempty"`
 	Queue    string          `json:"queue"`
+
+	// suppressFetchTrigger marks a resume synthesized by the setting poll to
+	// close out a previous handoff while adopting a new one. Fetching must not
+	// be triggered: the new handoff is still active. Never serialized or sent
+	// over the wire.
+	suppressFetchTrigger bool
 }
 
 type insertPayload struct {
 	Queue string `json:"queue"`
+}
+
+// queueDrainState is a producer's local view of the active queue drain. It's
+// kept separate from paused: a producer fetches no new jobs while either is
+// active.
+type queueDrainState string
+
+const (
+	queueDrainStateNone     queueDrainState = ""
+	queueDrainStateDraining queueDrainState = riverdriver.QueueDrainStateDraining
+	queueDrainStateDrained  queueDrainState = riverdriver.QueueDrainStateDrained
+)
+
+// queueDrainPollSnapshot is a producer's last observed drain row while
+// polling for queue setting changes. A nil pointer represents no active
+// drain.
+type queueDrainPollSnapshot struct {
+	key   string
+	state queueDrainState
 }
 
 func (p *producer) handleControlNotification(workCtx context.Context) func(notifier.NotificationTopic, string) {
@@ -493,7 +573,7 @@ func (p *producer) handleControlNotification(workCtx context.Context) func(notif
 		}
 
 		switch decoded.Action {
-		case controlActionMetadataChanged, controlActionPause, controlActionResume:
+		case controlActionDrain, controlActionDrainCompleted, controlActionDrainResume, controlActionMetadataChanged, controlActionPause, controlActionResume:
 			if decoded.Queue != rivercommon.AllQueuesString && decoded.Queue != p.config.Queue {
 				p.Logger.DebugContext(workCtx, p.Name+": Queue control notification for other queue", slog.String("action", string(decoded.Action)))
 				return
@@ -576,6 +656,54 @@ func (p *producer) fetchAndRunLoop(fetchCtx, workCtx context.Context) {
 				if p.config.QueueEventCallback != nil {
 					p.config.QueueEventCallback(&Event{Kind: EventKindQueueResumed, Queue: &rivertype.Queue{Name: p.config.Queue}})
 				}
+			case controlActionDrain:
+				if p.drainState != queueDrainStateNone && p.drainKey == msg.Key {
+					continue
+				}
+				p.drainState = queueDrainStateDraining
+				p.drainKey = msg.Key
+				p.Logger.DebugContext(workCtx, p.Name+": Queue draining started", slog.String("queue", p.config.Queue), slog.String("key", msg.Key))
+				p.testSignals.DrainStarted.Signal(struct{}{})
+				if p.config.QueueEventCallback != nil {
+					p.config.QueueEventCallback(&Event{DrainKey: msg.Key, Kind: EventKindQueueDrainStarted, Queue: &rivertype.Queue{Name: p.config.Queue}})
+				}
+			case controlActionDrainCompleted:
+				if p.drainState == queueDrainStateDrained && p.drainKey == msg.Key {
+					continue
+				}
+				if msg.Key != "" && p.drainState != queueDrainStateNone && msg.Key != p.drainKey {
+					p.Logger.DebugContext(workCtx, p.Name+": Ignoring stale drain completed event for a different key", slog.String("queue", p.config.Queue), slog.String("key", msg.Key))
+					continue
+				}
+				if msg.Key != "" {
+					p.drainKey = msg.Key
+				}
+				p.drainState = queueDrainStateDrained
+				p.Logger.DebugContext(workCtx, p.Name+": Queue drained", slog.String("queue", p.config.Queue), slog.String("key", p.drainKey))
+				p.testSignals.DrainCompleted.Signal(struct{}{})
+				if p.config.QueueEventCallback != nil {
+					p.config.QueueEventCallback(&Event{DrainKey: p.drainKey, Kind: EventKindQueueDrained, Queue: &rivertype.Queue{Name: p.config.Queue}})
+				}
+			case controlActionDrainResume:
+				if p.drainState == queueDrainStateNone {
+					continue
+				}
+				if msg.Key != "" && p.drainKey != "" && msg.Key != p.drainKey {
+					continue
+				}
+				// Resume notifications don't carry the key themselves, so use
+				// the drain key this producer observed.
+				drainKey := p.drainKey
+				p.drainState = queueDrainStateNone
+				p.drainKey = ""
+				p.Logger.DebugContext(workCtx, p.Name+": Queue drain resumed", slog.String("queue", p.config.Queue))
+				p.testSignals.DrainResumed.Signal(struct{}{})
+				if p.config.QueueEventCallback != nil {
+					p.config.QueueEventCallback(&Event{DrainKey: drainKey, Kind: EventKindQueueDrainResumed, Queue: &rivertype.Queue{Name: p.config.Queue}})
+				}
+				if !p.paused && !msg.suppressFetchTrigger {
+					p.fetchLimiter.Call() // a resumed drain may have available jobs waiting to be fetched
+				}
 			default:
 				p.Logger.DebugContext(workCtx, p.Name+": Unknown queue control action", "action", msg.Action)
 			}
@@ -591,7 +719,7 @@ func (p *producer) fetchAndRunLoop(fetchCtx, workCtx context.Context) {
 			default:
 			}
 		case result := <-p.jobResultCh:
-			p.removeActiveJob(result)
+			p.removeActiveJob(workCtx, result)
 			if p.fetchWhenSlotsAreAvailable {
 				// If we missed a fetch because all worker slots were full, or if we
 				// fetched the maximum number of jobs on the last attempt, get a little
@@ -638,7 +766,10 @@ func (p *producer) jitteredFetchPollInterval() time.Duration {
 
 func (p *producer) innerFetchLoop(workCtx context.Context, fetchResultCh chan producerFetchResult) {
 	var limit int
-	if p.paused {
+	if p.paused || p.drainState != queueDrainStateNone {
+		// A paused or draining producer fetches no new jobs. The count<=0
+		// dispatch continues servicing state changes while this producer's
+		// already-running jobs are allowed to finish.
 		limit = 0
 	} else {
 		limit = p.maxJobsToFetch()
@@ -670,19 +801,19 @@ func (p *producer) innerFetchLoop(workCtx context.Context, fetchResultCh chan pr
 			}
 			return
 		case result := <-p.jobResultCh:
-			p.removeActiveJob(result)
+			p.removeActiveJob(workCtx, result)
 		case jobID := <-p.cancelCh:
 			p.maybeCancelJob(workCtx, jobID)
 		}
 	}
 }
 
-func (p *producer) executorShutdownLoop() {
+func (p *producer) executorShutdownLoop(workCtx context.Context) {
 	// No more jobs will be fetched or executed. However, we must wait for all
 	// in-progress jobs to complete.
 	for len(p.activeJobs) != 0 {
 		result := <-p.jobResultCh
-		p.removeActiveJob(result)
+		p.removeActiveJob(workCtx, result)
 	}
 }
 
@@ -741,7 +872,7 @@ func (p *producer) addActiveJob(id int64, executor *jobexecutor.JobExecutor) {
 	p.activeJobs[id] = executor
 }
 
-func (p *producer) removeActiveJob(job *rivertype.JobRow) {
+func (p *producer) removeActiveJob(ctx context.Context, job *rivertype.JobRow) {
 	executor := p.activeJobs[job.ID]
 	delete(p.activeJobs, job.ID)
 	if executor == nil || executor.TryCloseSlot() {
@@ -749,6 +880,91 @@ func (p *producer) removeActiveJob(job *rivertype.JobRow) {
 	}
 	p.numJobsRan.Add(1)
 	p.state.JobFinish(job)
+	p.maybeCompleteDrain(ctx)
+}
+
+// maybeCompleteDrain triggers a conditional drain completion attempt when
+// this producer just finished its last local job while a drain is active. The
+// actual completion is a conditional UPDATE guarded by the fleet-wide running
+// count, so any producer (or a QueueDrain waiter) can attempt it safely.
+func (p *producer) maybeCompleteDrain(ctx context.Context) {
+	if p.drainState != queueDrainStateDraining || len(p.activeJobs) != 0 {
+		return
+	}
+	p.startDrainCompleteAttempt(ctx, p.drainKey)
+}
+
+// startDrainCompleteAttempt runs one conditional drain completion attempt in
+// the background. It's safe to invoke concurrently from multiple producers;
+// the conditional UPDATE ensures exactly one attempt completes a drain. On
+// success a drain_completed control event is broadcast and injected into this
+// producer's control channel.
+//
+// The attempt intentionally outlives the caller's context (it may run during
+// shutdown after work context cancellation), so it derives a detached context
+// with a bounded timeout.
+func (p *producer) startDrainCompleteAttempt(parentCtx context.Context, key string) {
+	if key == "" {
+		return
+	}
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(parentCtx), 10*time.Second)
+		defer cancel()
+
+		p.testSignals.TriedCompleteDrain.Signal(struct{}{})
+
+		tx, err := p.exec.Begin(ctx)
+		if err != nil {
+			p.Logger.ErrorContext(ctx, p.Name+": Error beginning drain completion transaction", slog.String("err", err.Error()))
+			return
+		}
+		defer dbutil.RollbackWithoutCancel(ctx, tx)
+
+		rowsAffected, err := tx.QueueDrainComplete(ctx, &riverdriver.QueueDrainCompleteParams{
+			Now:    p.Time.NowOrNil(),
+			Queue:  p.config.Queue,
+			Schema: p.config.Schema,
+		})
+		if err != nil {
+			p.Logger.ErrorContext(ctx, p.Name+": Error completing queue drain", slog.String("queue", p.config.Queue), slog.String("err", err.Error()))
+			return
+		}
+		if rowsAffected < 1 {
+			return
+		}
+
+		controlEvent := &controlEventPayload{Action: controlActionDrainCompleted, Key: key, Queue: p.config.Queue}
+		if p.config.SupportsListenNotify {
+			payload, err := json.Marshal(controlEvent)
+			if err != nil {
+				p.Logger.ErrorContext(ctx, p.Name+": Error marshaling drain completed notification", slog.String("err", err.Error()))
+				return
+			}
+			if err := tx.NotifyMany(ctx, &riverdriver.NotifyManyParams{
+				Payload: []string{string(payload)},
+				Schema:  p.config.Schema,
+				Topic:   string(notifier.NotificationTopicControl),
+			}); err != nil {
+				p.Logger.ErrorContext(ctx, p.Name+": Error notifying about drain completion", slog.String("err", err.Error()))
+				return
+			}
+		}
+
+		if err := tx.Commit(ctx); err != nil {
+			p.Logger.ErrorContext(ctx, p.Name+": Error committing drain completion", slog.String("err", err.Error()))
+			return
+		}
+
+		// Self-inject so this producer converges even without a listener or
+		// when its own notification would otherwise round trip.
+		select {
+		case <-ctx.Done():
+		case p.queueControlCh <- controlEvent:
+		default:
+			p.Logger.WarnContext(ctx, p.Name+": Drain completed control event dropped due to full buffer")
+		}
+	}()
 }
 
 func (p *producer) handleWorkerStuck(ctx context.Context, executor *jobexecutor.JobExecutor, job *rivertype.JobRow) {
@@ -963,10 +1179,74 @@ func (p *producer) handleWorkerDone(job *rivertype.JobRow) {
 	p.jobResultCh <- job
 }
 
-func (p *producer) pollForSettingChanges(ctx context.Context, wg *sync.WaitGroup, lastPaused bool, lastMetadata []byte) {
+func (p *producer) fetchInitialDrainState(ctx context.Context) *queueDrainPollSnapshot {
+	row, err := timeoututil.WithTimeoutV(ctx, 10*time.Second, p.Name+".fetchInitialDrainState", func(ctx context.Context) (*riverdriver.QueueDrainRow, error) {
+		return p.exec.QueueDrainGetActive(ctx, &riverdriver.QueueDrainGetParams{
+			Queue:  p.config.Queue,
+			Schema: p.config.Schema,
+		})
+	})
+	if err != nil {
+		if !errors.Is(err, rivertype.ErrNotFound) {
+			p.Logger.ErrorContext(ctx, p.Name+": Error fetching initial queue drain state", slog.String("err", err.Error()))
+		}
+		return nil
+	}
+	return &queueDrainPollSnapshot{key: row.Key, state: queueDrainState(row.State)}
+}
+
+// drainTransitionPayloads derives the ordered control events needed to move
+// from a last-observed drain snapshot to the current one. It returns no
+// payloads when no transition is needed. Polling may coalesce several
+// transitions between ticks (a previous handoff can complete and resume while
+// a new one starts), so a key change first closes out the old handoff before
+// adopting the new one; the payloads are processed in order on the producer's
+// control channel.
+func drainTransitionPayloads(queueName string, last, current *queueDrainPollSnapshot) []*controlEventPayload {
+	eventFor := func(snapshot *queueDrainPollSnapshot) *controlEventPayload {
+		// A first sighting of an already-drained handoff reports completion
+		// directly so the gate converges in one step without a stale draining
+		// phase.
+		action := controlActionDrain
+		if snapshot.state == queueDrainStateDrained {
+			action = controlActionDrainCompleted
+		}
+		return &controlEventPayload{Action: action, Key: snapshot.key, Queue: queueName}
+	}
+
+	switch {
+	case last == nil && current != nil:
+		return []*controlEventPayload{eventFor(current)}
+	case last != nil && current == nil:
+		return []*controlEventPayload{{Action: controlActionDrainResume, Key: last.key, Queue: queueName}}
+	case last != nil && current != nil:
+		if last.key == current.key {
+			if last.state == queueDrainStateDraining && current.state == queueDrainStateDrained {
+				return []*controlEventPayload{{Action: controlActionDrainCompleted, Key: current.key, Queue: queueName}}
+			}
+			return nil
+		}
+		return []*controlEventPayload{
+			// We missed the old handoff's completion and resume between ticks;
+			// close it out before adopting the new one. This resume doesn't
+			// reopen fetching because the new handoff is still active.
+			{Action: controlActionDrainResume, Key: last.key, Queue: queueName, suppressFetchTrigger: true},
+			eventFor(current),
+		}
+	}
+	return nil
+}
+
+func (p *producer) pollForSettingChanges(ctx context.Context, wg *sync.WaitGroup, lastPaused bool, lastMetadata []byte, lastDrain *queueDrainPollSnapshot) {
 	defer wg.Done()
 
-	ticker := time.NewTicker(p.config.QueuePollInterval)
+	pollInterval := p.config.QueuePollInterval
+	if p.config.Notifier != nil {
+		// With a notifier, polling is only a fallback for lost notifications.
+		pollInterval = p.config.QueueSettingPollInterval
+	}
+
+	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -1035,6 +1315,51 @@ func (p *producer) pollForSettingChanges(ctx context.Context, wg *sync.WaitGroup
 					p.Logger.WarnContext(ctx, p.Name+": Queue control notification dropped due to full buffer", slog.String("action", string(controlActionMetadataChanged)))
 				}
 			}
+
+			// Look for a change in the queue's drain state:
+			var currentDrain *queueDrainPollSnapshot
+			drainRow, err := p.exec.QueueDrainGetActive(ctx, &riverdriver.QueueDrainGetParams{
+				Queue:  p.config.Queue,
+				Schema: p.config.Schema,
+			})
+			switch {
+			case err == nil:
+				currentDrain = &queueDrainPollSnapshot{key: drainRow.Key, state: queueDrainState(drainRow.State)}
+			case errors.Is(err, rivertype.ErrNotFound):
+				currentDrain = nil
+			default:
+				p.Logger.ErrorContext(ctx, p.Name+": Error fetching queue drain state", slog.String("err", err.Error()))
+				continue
+			}
+
+			payloads := drainTransitionPayloads(p.config.Queue, lastDrain, currentDrain)
+			delivered := true
+		payloadLoop:
+			for _, payload := range payloads {
+				p.Logger.DebugContext(ctx, p.Name+": Queue drain state changed from polling",
+					slog.String("queue", p.config.Queue),
+					slog.String("action", string(payload.Action)),
+					slog.String("key", payload.Key),
+				)
+
+				select {
+				case p.queueControlCh <- payload:
+				default:
+					// Keep the previous baseline so the transition is replayed
+					// next tick. Control handlers treat repeated states as
+					// no-ops, so redelivery is harmless.
+					delivered = false
+					p.Logger.WarnContext(ctx, p.Name+": Queue control notification dropped due to full buffer", slog.String("action", string(payload.Action)))
+					break payloadLoop
+				}
+			}
+			if delivered {
+				lastDrain = currentDrain
+			}
+
+			// Opportunistic completion is driven by the local job completion
+			// path (maybeCompleteDrain) and by QueueDrain waiters; this poll
+			// only converges the producer's local gate to the database state.
 
 			p.testSignals.PolledQueueConfig.Signal(struct{}{})
 		}

@@ -9,6 +9,7 @@ sql:
       - river_migration.sql
       - river_notification.sql
       - river_queue.sql
+      - river_queue_drain.sql
       - schema.sql
     schema:
       - pg_misc.sql
@@ -17,6 +18,7 @@ sql:
       - river_migration.sql
       - river_notification.sql
       - river_queue.sql
+      - river_queue_drain.sql
       - schema.sql
     gen:
       go:

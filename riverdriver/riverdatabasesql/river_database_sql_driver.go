@@ -967,6 +967,75 @@ func (e *Executor) QueueDeleteExpired(ctx context.Context, params *riverdriver.Q
 	return queueNames, nil
 }
 
+func (e *Executor) QueueDrainComplete(ctx context.Context, params *riverdriver.QueueDrainCompleteParams) (int64, error) {
+	rowsAffected, err := dbsqlc.New().QueueDrainComplete(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.QueueDrainCompleteParams{
+		Now:   params.Now,
+		Queue: params.Queue,
+	})
+	if err != nil {
+		return 0, interpretError(err)
+	}
+	return rowsAffected, nil
+}
+
+func (e *Executor) QueueDrainDeleteResumed(ctx context.Context, params *riverdriver.QueueDrainDeleteResumedParams) (int64, error) {
+	rowsAffected, err := dbsqlc.New().QueueDrainDeleteResumed(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.QueueDrainDeleteResumedParams{
+		UpdatedAtHorizon: params.UpdatedAtHorizon,
+	})
+	if err != nil {
+		return 0, interpretError(err)
+	}
+	return rowsAffected, nil
+}
+
+func (e *Executor) QueueDrainGetActive(ctx context.Context, params *riverdriver.QueueDrainGetParams) (*riverdriver.QueueDrainRow, error) {
+	row, err := dbsqlc.New().QueueDrainGetActive(schemaTemplateParam(ctx, params.Schema), e.dbtx, params.Queue)
+	if err != nil {
+		return nil, interpretError(err)
+	}
+	return queueDrainRowFromGetActive(row), nil
+}
+
+func (e *Executor) QueueDrainGetByKey(ctx context.Context, params *riverdriver.QueueDrainGetByKeyParams) (*riverdriver.QueueDrainRow, error) {
+	row, err := dbsqlc.New().QueueDrainGetByKey(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.QueueDrainGetByKeyParams{
+		Key:   params.Key,
+		Queue: params.Queue,
+	})
+	if err != nil {
+		return nil, interpretError(err)
+	}
+	return queueDrainRowFromGetByKey(row), nil
+}
+
+func (e *Executor) QueueDrainInsert(ctx context.Context, params *riverdriver.QueueDrainInsertParams) (*riverdriver.QueueDrainRow, error) {
+	row, err := dbsqlc.New().QueueDrainInsert(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.QueueDrainInsertParams{
+		Key:   params.Key,
+		Now:   params.Now,
+		Queue: params.Queue,
+	})
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			// ON CONFLICT DO NOTHING: an active drain with the same or a
+			// different key already exists. Callers distinguish the cases with
+			// QueueDrainGetActive.
+			return nil, nil //nolint:nilnil
+		}
+		return nil, interpretError(err)
+	}
+	return queueDrainFromInternal(row), nil
+}
+
+func (e *Executor) QueueDrainResume(ctx context.Context, params *riverdriver.QueueDrainResumeParams) (int64, error) {
+	rowsAffected, err := dbsqlc.New().QueueDrainResume(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.QueueDrainResumeParams{
+		Now:   params.Now,
+		Queue: params.Queue,
+	})
+	if err != nil {
+		return 0, interpretError(err)
+	}
+	return rowsAffected, nil
+}
+
 func (e *Executor) QueueGet(ctx context.Context, params *riverdriver.QueueGetParams) (*rivertype.Queue, error) {
 	queue, err := dbsqlc.New().QueueGet(schemaTemplateParam(ctx, params.Schema), e.dbtx, params.Name)
 	if err != nil {
@@ -1290,6 +1359,55 @@ func migrationFromInternal(internal *dbsqlc.RiverMigration) *riverdriver.Migrati
 		Line:      internal.Line,
 		Version:   int(internal.Version),
 	}
+}
+
+func queueDrainFromInternal(internal *dbsqlc.RiverQueueDrain) *riverdriver.QueueDrainRow {
+	var drainedAt, resumedAt *time.Time
+	if internal.DrainedAt != nil {
+		t := internal.DrainedAt.UTC()
+		drainedAt = &t
+	}
+	if internal.ResumedAt != nil {
+		t := internal.ResumedAt.UTC()
+		resumedAt = &t
+	}
+	return &riverdriver.QueueDrainRow{
+		CreatedAt: internal.CreatedAt.UTC(),
+		DrainedAt: drainedAt,
+		Key:       internal.Key,
+		Queue:     internal.Queue,
+		ResumedAt: resumedAt,
+		State:     internal.State,
+		UpdatedAt: internal.UpdatedAt.UTC(),
+	}
+}
+
+func queueDrainRowFromGetActive(internal *dbsqlc.QueueDrainGetActiveRow) *riverdriver.QueueDrainRow {
+	row := queueDrainFromInternal(&dbsqlc.RiverQueueDrain{
+		Queue:     internal.Queue,
+		Key:       internal.Key,
+		State:     internal.State,
+		CreatedAt: internal.CreatedAt,
+		DrainedAt: internal.DrainedAt,
+		ResumedAt: internal.ResumedAt,
+		UpdatedAt: internal.UpdatedAt,
+	})
+	row.RunningCount = internal.RunningCount
+	return row
+}
+
+func queueDrainRowFromGetByKey(internal *dbsqlc.QueueDrainGetByKeyRow) *riverdriver.QueueDrainRow {
+	row := queueDrainFromInternal(&dbsqlc.RiverQueueDrain{
+		Queue:     internal.Queue,
+		Key:       internal.Key,
+		State:     internal.State,
+		CreatedAt: internal.CreatedAt,
+		DrainedAt: internal.DrainedAt,
+		ResumedAt: internal.ResumedAt,
+		UpdatedAt: internal.UpdatedAt,
+	})
+	row.RunningCount = internal.RunningCount
+	return row
 }
 
 func queueFromInternal(internal *dbsqlc.RiverQueue) *rivertype.Queue {

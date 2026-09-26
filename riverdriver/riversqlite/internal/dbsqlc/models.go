@@ -57,6 +57,16 @@ type RiverQueue struct {
 	UpdatedAt time.Time
 }
 
+type RiverQueueDrain struct {
+	Queue     string
+	Key       string
+	State     string
+	CreatedAt time.Time
+	DrainedAt *time.Time
+	ResumedAt *time.Time
+	UpdatedAt time.Time
+}
+
 type SqliteMaster struct {
 	Type     *string
 	Name     *string

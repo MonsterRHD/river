@@ -156,6 +156,22 @@ type queueCleanerRunOnceResult struct {
 func (s *QueueCleaner) runOnce(ctx context.Context) (*queueCleanerRunOnceResult, error) {
 	res := &queueCleanerRunOnceResult{QueuesDeleted: make([]string, 0, 10)}
 
+	// Remove drain (handoff) records that were explicitly resumed beyond the
+	// retention horizon. Active drains are never matched by this delete. This
+	// runs before the queue delete batches rather than after them; the two
+	// cleanups are independent, and leading with it keeps the time after the
+	// last batch signal free of follow-up queries.
+	err := timeoututil.WithTimeout(ctx, riversharedmaintenance.TimeoutDefault, s.Name+".deleteResumedDrains", func(ctx context.Context) error {
+		_, err := s.exec.QueueDrainDeleteResumed(ctx, &riverdriver.QueueDrainDeleteResumedParams{
+			Schema:           s.Config.Schema,
+			UpdatedAtHorizon: time.Now().Add(-s.Config.RetentionPeriod),
+		})
+		return err
+	})
+	if err != nil && !errors.Is(err, context.Canceled) {
+		s.Logger.ErrorContext(ctx, s.Name+": Error cleaning resumed queue drains", slog.String("error", err.Error()))
+	}
+
 	for {
 		queuesDeleted, err := timeoututil.WithTimeoutV(ctx, riversharedmaintenance.TimeoutDefault, s.Name+".runOnce", func(ctx context.Context) ([]string, error) {
 			queuesDeleted, err := s.exec.QueueDeleteExpired(ctx, &riverdriver.QueueDeleteExpiredParams{

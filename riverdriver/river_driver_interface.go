@@ -24,6 +24,13 @@ import (
 
 const AllQueuesString = "*"
 
+// Possible states of a queue drain (handoff) record.
+const (
+	QueueDrainStateDraining = "draining"
+	QueueDrainStateDrained  = "drained"
+	QueueDrainStateResumed  = "resumed"
+)
+
 const (
 	DatabaseNamePostgres = "postgres"
 	DatabaseNameSQLite   = "sqlite"
@@ -293,6 +300,12 @@ type Executor interface {
 
 	QueueCreateOrSetUpdatedAt(ctx context.Context, params *QueueCreateOrSetUpdatedAtParams) (*rivertype.Queue, error)
 	QueueDeleteExpired(ctx context.Context, params *QueueDeleteExpiredParams) ([]string, error)
+	QueueDrainComplete(ctx context.Context, params *QueueDrainCompleteParams) (int64, error)
+	QueueDrainDeleteResumed(ctx context.Context, params *QueueDrainDeleteResumedParams) (int64, error)
+	QueueDrainGetActive(ctx context.Context, params *QueueDrainGetParams) (*QueueDrainRow, error)
+	QueueDrainGetByKey(ctx context.Context, params *QueueDrainGetByKeyParams) (*QueueDrainRow, error)
+	QueueDrainInsert(ctx context.Context, params *QueueDrainInsertParams) (*QueueDrainRow, error)
+	QueueDrainResume(ctx context.Context, params *QueueDrainResumeParams) (int64, error)
 	QueueGet(ctx context.Context, params *QueueGetParams) (*rivertype.Queue, error)
 	QueueList(ctx context.Context, params *QueueListParams) ([]*rivertype.Queue, error)
 	QueueNameList(ctx context.Context, params *QueueNameListParams) ([]string, error)
@@ -855,6 +868,57 @@ type ProducerKeepAliveParams struct {
 	StaleUpdatedAtHorizon time.Time
 }
 
+// QueueDrainRow is a single queue drain (handoff) record. RunningCount is the
+// number of jobs currently in a `running` state for the drain's queue, as
+// computed at the time the row was read.
+//
+// API is not stable. DO NOT USE.
+type QueueDrainRow struct {
+	CreatedAt    time.Time
+	DrainedAt    *time.Time
+	Key          string
+	Queue        string
+	ResumedAt    *time.Time
+	RunningCount int64
+	State        string
+	UpdatedAt    time.Time
+}
+
+type QueueDrainCompleteParams struct {
+	Now    *time.Time
+	Queue  string
+	Schema string
+}
+
+type QueueDrainDeleteResumedParams struct {
+	Schema           string
+	UpdatedAtHorizon time.Time
+}
+
+type QueueDrainGetParams struct {
+	Queue  string
+	Schema string
+}
+
+type QueueDrainGetByKeyParams struct {
+	Key    string
+	Queue  string
+	Schema string
+}
+
+type QueueDrainInsertParams struct {
+	Key    string
+	Now    *time.Time
+	Queue  string
+	Schema string
+}
+
+type QueueDrainResumeParams struct {
+	Now    *time.Time
+	Queue  string
+	Schema string
+}
+
 type QueueCreateOrSetUpdatedAtParams struct {
 	Metadata  []byte
 	Name      string
@@ -963,8 +1027,10 @@ func MigrationLineMainTruncateTables(version int) []string {
 		return []string{"river_job", "river_leader", "river_queue"}
 	case 5, 6:
 		return []string{"river_job", "river_leader", "river_queue", "river_client", "river_client_queue"}
-	case 0, 7:
+	case 7:
 		return []string{"river_job", "river_leader", "river_queue", "river_notification"}
+	case 0, 8:
+		return []string{"river_job", "river_leader", "river_queue", "river_queue_drain", "river_notification"}
 	}
 
 	panic(fmt.Sprintf("unrecognized migration version: %d", version))
