@@ -17,7 +17,7 @@
   {
     "id": 4,
     "passed": false,
-    "reason": "handleBatch 在数据库提交后调用 deliverEvents；ctx deadline 分支直接退出事件投递。"
+    "reason": "handleBatch 在数据库提交后调用 deliverEvents；ctx 到期分支直接退出事件投递。"
   },
   {
     "id": 5,
@@ -27,7 +27,7 @@
   {
     "id": 6,
     "passed": false,
-    "reason": "数据库连接被拒绝使 drain deadline 的数据库恢复用例未执行。"
+    "reason": "数据库连接被拒绝，排空期限恢复用例未执行。"
   },
   {
     "id": 7,
