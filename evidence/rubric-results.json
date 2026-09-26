@@ -1,0 +1,42 @@
+[
+  {
+    "id": 1,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 2,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 3,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 4,
+    "passed": false,
+    "reason": "handleBatch 在数据库提交后调用 deliverEvents；ctx deadline 分支直接退出事件投递。"
+  },
+  {
+    "id": 5,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 6,
+    "passed": false,
+    "reason": "PostgreSQL 连接拒绝使 drain deadline 的数据库恢复用例未执行。"
+  },
+  {
+    "id": 7,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 8,
+    "passed": true,
+    "reason": ""
+  }
+]

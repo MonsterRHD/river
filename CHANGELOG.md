@@ -7,8 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added `ShutdownTimeout` config option, which bounds how long `Stop` and `StopAndCancel` wait for final job results already produced by workers to be persisted to the database and delivered to subscriptions during shutdown. It defaults to one minute. When the timeout elapses (or the database becomes unavailable), `Stop` and `StopAndCancel` now return the new `ErrShutdownIncomplete` error instead of silently dropping results; affected jobs are left in their previous state (usually `running`) and remain recoverable through job rescue, so no job is reported as successful spuriously.
+
+### Changed
+
+- `StopAndCancel` now signals producers to stop fetching and starting new jobs before cancelling in-progress job contexts, so no new execution can begin while running jobs are being cancelled.
+- The batch job completer now persists every accepted job result and emits its subscription event before the client finishes shutting down. If a batch write partially fails, only unacknowledged items are retried; already-confirmed items are never rewritten.
+
 ### Fixed
 
+- Fixed final job results that had been returned by workers but were still buffered in the batch completer being lost when `Stop` or `StopAndCancel` shut services down in parallel, and the corresponding jobs being treated as stale running jobs by the rescuer. The completer now drains after producers have stopped and surfaces a timeout or database error through `Stop`/`StopAndCancel`.
 - Fixed SQLite job list pagination skipping or repeating jobs by formatting cursor timestamps consistently with stored timestamps. [PR #1374](https://github.com/riverqueue/river/pull/1374).
 - Improved PostgreSQL job listing performance when filtering by one finalized state (`completed`, `cancelled`, or `discarded`) and sorting by finalized time, including in River UI. [PR #1374](https://github.com/riverqueue/river/pull/1374).
 - Fixed `JobRescuer` overwriting jobs that complete, leave the running state, or are claimed again by another worker after being fetched for rescue, preserving their state, errors, metadata, and timestamps across PostgreSQL and SQLite drivers. Fixes [#1302](https://github.com/riverqueue/river/issues/1302). [PR #1373](https://github.com/riverqueue/river/pull/1373).

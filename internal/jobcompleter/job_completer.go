@@ -3,8 +3,10 @@ package jobcompleter
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -35,6 +37,15 @@ type JobCompleter interface {
 	// ResetSubscribeChan resets the subscription channel for the completer. It
 	// must only be called when the completer is stopped.
 	ResetSubscribeChan(subscribeCh SubscribeChan)
+}
+
+// ServiceWithStopError is implemented by completers that can fail to finish
+// all accepted work during Stop. StopError is only meaningful once Stop has
+// returned. A non-nil result means one or more accepted job results were not
+// persisted; the affected jobs remain in their previous (usually running)
+// state in the database and are recoverable by the job rescuer.
+type ServiceWithStopError interface {
+	StopError() error
 }
 
 type SubscribeChan chan<- []CompleterJobUpdated
@@ -126,7 +137,7 @@ func (c *InlineCompleter) JobSetStateIfRunning(ctx context.Context, stats *jobst
 
 	start := c.Time.Now()
 
-	jobs, err := withRetries(ctx, &c.BaseService, c.disableSleep, func(ctx context.Context) ([]*rivertype.JobRow, error) {
+	jobs, err := withRetries(context.WithoutCancel(ctx), ctx, &c.BaseService, c.disableSleep, func(ctx context.Context) ([]*rivertype.JobRow, error) {
 		jobs, err := c.pilot.JobSetStateIfRunningMany(ctx, c.exec, setStateParamsToMany(c.Time.NowOrNil(), c.schema, params))
 		if err != nil {
 			return nil, err
@@ -153,6 +164,13 @@ func (c *InlineCompleter) JobSetStateIfRunning(ctx context.Context, stats *jobst
 
 func (c *InlineCompleter) ResetSubscribeChan(subscribeCh SubscribeChan) {
 	c.subscribeCh = subscribeCh
+}
+
+// StopError always returns nil for the inline completer because every
+// completion is performed synchronously by its caller, so any error is already
+// returned directly from JobSetStateIfRunning.
+func (c *InlineCompleter) StopError() error {
+	return nil
 }
 
 func (c *InlineCompleter) Start(ctx context.Context) error {
@@ -211,6 +229,9 @@ type AsyncCompleter struct {
 	pilot        riverpilot.Pilot
 	schema       string
 	subscribeCh  SubscribeChan
+
+	stopErrMu sync.Mutex
+	stopErr   error
 }
 
 func NewAsyncCompleter(archetype *baseservice.Archetype, schema string, exec riverdriver.Executor, pilot riverpilot.Pilot, subscribeCh SubscribeChan) *AsyncCompleter {
@@ -237,7 +258,7 @@ func (c *AsyncCompleter) JobSetStateIfRunning(ctx context.Context, stats *jobsta
 	start := c.Time.Now()
 
 	c.errGroup.Go(func() error {
-		jobs, err := withRetries(ctx, &c.BaseService, c.disableSleep, func(ctx context.Context) ([]*rivertype.JobRow, error) {
+		jobs, err := withRetries(context.WithoutCancel(ctx), ctx, &c.BaseService, c.disableSleep, func(ctx context.Context) ([]*rivertype.JobRow, error) {
 			rows, err := c.pilot.JobSetStateIfRunningMany(ctx, c.exec, setStateParamsToMany(c.Time.NowOrNil(), c.schema, params))
 			if err != nil {
 				return nil, err
@@ -268,6 +289,27 @@ func (c *AsyncCompleter) ResetSubscribeChan(subscribeCh SubscribeChan) {
 	c.subscribeCh = subscribeCh
 }
 
+// StopError returns the first error that prevented an asynchronously completed
+// job from being persisted, if any. It's only meaningful after Stop has
+// returned.
+func (c *AsyncCompleter) StopError() error {
+	c.stopErrMu.Lock()
+	defer c.stopErrMu.Unlock()
+
+	return c.stopErr
+}
+
+func (c *AsyncCompleter) setStopErr(err error) {
+	c.stopErrMu.Lock()
+	defer c.stopErrMu.Unlock()
+
+	// Preserve the first failure, but allow resetting on restart.
+	if err != nil && c.stopErr != nil {
+		return
+	}
+	c.stopErr = err
+}
+
 func (c *AsyncCompleter) Start(ctx context.Context) error {
 	ctx, shouldStart, started, stopped := c.StartInit(ctx)
 	if !shouldStart {
@@ -278,6 +320,10 @@ func (c *AsyncCompleter) Start(ctx context.Context) error {
 		panic("subscribeCh must be non-nil")
 	}
 
+	// Clear any stop error from a previous run so it can't surface after a
+	// successful restart.
+	c.setStopErr(nil)
+
 	go func() {
 		started()
 		defer stopped() // this defer should come first so it's first out
@@ -287,6 +333,7 @@ func (c *AsyncCompleter) Start(ctx context.Context) error {
 
 		if err := c.errGroup.Wait(); err != nil {
 			c.Logger.ErrorContext(ctx, "Error waiting on async completer", "err", err)
+			c.setStopErr(err)
 		}
 	}()
 
@@ -313,7 +360,8 @@ type BatchCompleter struct {
 	batchReadyChan       chan struct{}
 	completionMaxSize    int  // configurable for testing purposes; max jobs to complete in single database operation
 	disableSleep         bool // disable sleep in testing
-	maxBacklog           int  // configurable for testing purposes; emergency backlog threshold where a warning is logged
+	drainTimeout         time.Duration
+	maxBacklog           int // configurable for testing purposes; emergency backlog threshold where a warning is logged
 	exec                 riverdriver.Executor
 	pilot                riverpilot.Pilot
 	schema               string
@@ -322,19 +370,42 @@ type BatchCompleter struct {
 	subscribeCh          SubscribeChan
 	waitOnBacklogChan    chan struct{}
 	waitOnBacklogWaiting bool
+
+	stopErrMu sync.Mutex
+	stopErr   error
+
+	// acceptingResults is set to false when a shutdown drain gives up. Once
+	// false, JobSetStateIfRunning returns the stop error instead of buffering
+	// results that would never be persisted or blocking on backpressure after
+	// the run goroutine has exited.
+	acceptingResults atomic.Bool
 }
 
-func NewBatchCompleter(archetype *baseservice.Archetype, schema string, exec riverdriver.Executor, pilot riverpilot.Pilot, subscribeCh SubscribeChan) *BatchCompleter {
+// DrainTimeoutDefault is the default maximum amount of time the batch
+// completer will spend persisting accepted job results and emitting their
+// subscription events while shutting down. It's chosen to accommodate at least
+// one full retry cycle (three attempts, ten second hot operation timeout
+// each) plus a quick final attempt.
+const DrainTimeoutDefault = 1 * time.Minute
+
+// drainIdleWait is how long the shutdown drain waits for a batch-ready signal
+// before rechecking the backlog. In a normal client shutdown producers have
+// already enqueued every result before the completer starts draining, so this
+// only matters for standalone use where results may arrive concurrently.
+const drainIdleWait = 50 * time.Millisecond
+
+func NewBatchCompleter(archetype *baseservice.Archetype, schema string, exec riverdriver.Executor, pilot riverpilot.Pilot, subscribeCh SubscribeChan, drainTimeout time.Duration) *BatchCompleter {
 	const (
 		completionMaxSize    = 5_000
 		backlogWaitThreshold = completionMaxSize * 2
 		maxBacklog           = 20_000
 	)
 
-	return baseservice.Init(archetype, &BatchCompleter{
+	completer := baseservice.Init(archetype, &BatchCompleter{
 		backlogWaitThreshold: backlogWaitThreshold,
 		batchReadyChan:       make(chan struct{}, 1),
 		completionMaxSize:    completionMaxSize,
+		drainTimeout:         drainTimeout,
 		exec:                 exec,
 		maxBacklog:           maxBacklog,
 		pilot:                pilot,
@@ -342,10 +413,51 @@ func NewBatchCompleter(archetype *baseservice.Archetype, schema string, exec riv
 		setStateParams:       make(map[int64]batchCompleterSetState),
 		subscribeCh:          subscribeCh,
 	})
+	// Accept results from construction; a drain that gives up flips this off
+	// until the next Start.
+	completer.acceptingResults.Store(true)
+
+	return completer
 }
 
 func (c *BatchCompleter) ResetSubscribeChan(subscribeCh SubscribeChan) {
 	c.subscribeCh = subscribeCh
+}
+
+// drainTimeoutEffective returns the bounded amount of time the completer may
+// spend persisting accepted results during shutdown. A non-positive value
+// falls back to the default.
+func (c *BatchCompleter) drainTimeoutEffective() time.Duration {
+	if c.drainTimeout <= 0 {
+		return DrainTimeoutDefault
+	}
+	return c.drainTimeout
+}
+
+// StopError returns the error that prevented accepted job results from being
+// persisted during shutdown, if any. It's only meaningful after Stop has
+// returned. A nil result means every accepted result was written and its
+// subscription event was handed off.
+func (c *BatchCompleter) StopError() error {
+	c.stopErrMu.Lock()
+	defer c.stopErrMu.Unlock()
+
+	return c.stopErr
+}
+
+func (c *BatchCompleter) setAcceptingResults(accepting bool) {
+	c.acceptingResults.Store(accepting)
+}
+
+func (c *BatchCompleter) setStopErr(err error) {
+	c.stopErrMu.Lock()
+	defer c.stopErrMu.Unlock()
+
+	// Preserve the first failure, but allow resetting on restart.
+	if err != nil && c.stopErr != nil {
+		return
+	}
+	c.stopErr = err
 }
 
 func (c *BatchCompleter) Start(ctx context.Context) error {
@@ -357,6 +469,11 @@ func (c *BatchCompleter) Start(ctx context.Context) error {
 	if c.subscribeCh == nil {
 		panic("subscribeCh must be non-nil")
 	}
+
+	// Clear any drain error from a previous run so it can't surface after a
+	// successful restart.
+	c.setStopErr(nil)
+	c.setAcceptingResults(true)
 
 	go func() {
 		started()
@@ -376,16 +493,23 @@ func (c *BatchCompleter) Start(ctx context.Context) error {
 		}
 
 		for numTicks := 0; ; numTicks++ {
+			// batchReady indicates a producer explicitly signaled that the
+			// backlog reached the ready threshold, in which case a batch is
+			// handled immediately regardless of the tick cadence.
+			var batchReady bool
+
 			select {
 			case <-stopCtx.Done():
-				// Try to insert last batch before leaving. Note we use the
-				// original context so operations aren't immediately cancelled.
-				if err := c.handleBatch(ctx); err != nil {
-					c.Logger.ErrorContext(ctx, c.Name+": Error completing batch", "err", err)
-				}
+				// Producers have all stopped by the time the completer is
+				// stopped, so every in-flight work unit's final result has
+				// already been accepted. Drain them to the database within a
+				// bounded deadline, emitting subscription events as each
+				// batch is confirmed.
+				c.drain(ctx)
 				return
 
 			case <-c.batchReadyChan:
+				batchReady = true
 			case <-ticker.C:
 			}
 
@@ -394,9 +518,10 @@ func (c *BatchCompleter) Start(ctx context.Context) error {
 			// waiting too long. However, don't start a complete operation until
 			// we reach a minimum threshold unless we're on a tick that's a
 			// multiple of 5. So, jobs will be completed every 250ms even if the
-			// threshold hasn't been met.
+			// threshold hasn't been met. An explicit batch-ready signal always
+			// qualifies.
 			const batchCompleterStartThreshold = 100
-			if backlogSize() < min(c.backlogWaitThresholdEffective(), batchCompleterStartThreshold) && numTicks != 0 && numTicks%5 != 0 {
+			if !batchReady && backlogSize() < min(c.backlogWaitThresholdEffective(), batchCompleterStartThreshold) && numTicks != 0 && numTicks%5 != 0 {
 				continue
 			}
 
@@ -417,6 +542,107 @@ func (c *BatchCompleter) Start(ctx context.Context) error {
 	}()
 
 	return nil
+}
+
+// ErrDrainDeadlineExceeded indicates that the batch completer's bounded
+// shutdown drain ended before every accepted job result could be persisted.
+// Jobs belonging to unpersisted results are left untouched in the database
+// (typically still running), so they stay recoverable via job rescue rather
+// than being reported as completed.
+var ErrDrainDeadlineExceeded = errors.New("job completer shutdown drain deadline exceeded")
+
+// drain persists every job result accepted before shutdown within the
+// configured drain timeout. Confirmed batches are written to the database and
+// their subscription events are emitted in order. A failed write is retried
+// with backoff until every accepted result is confirmed, the drain deadline
+// elapses, or a non-retryable error (like a closed pool) is encountered.
+//
+// On failure, unconfirmed results stay in the completer's backlog and their
+// database rows are left untouched (usually in running state), so the job
+// rescuer can recover them after restart. The failure is recorded and
+// surfaced through StopError rather than being logged and forgotten.
+func (c *BatchCompleter) drain(ctx context.Context) {
+	drainTimeout := c.drainTimeoutEffective()
+
+	// The run context is already stopping, so detach from its cancellation,
+	// but enforce an explicit, controllable deadline for the drain.
+	drainCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), drainTimeout)
+	defer cancel()
+
+	c.Logger.InfoContext(ctx, c.Name+": Draining accepted job completions", slog.Duration("drain_timeout", drainTimeout))
+
+	var lastErr error
+	for {
+		err := c.handleBatch(drainCtx)
+		if err != nil && isNonRetryableCompleterError(err) {
+			// A non-retryable write failure (e.g. closed pool) drops the
+			// in-flight items from the backlog, but their database rows were
+			// never written, so they're still recoverable by rescue.
+			c.abandonDrain(ctx, -1, fmt.Errorf("job completer gave up draining accepted job completions: %w", err))
+			return
+		} else if err != nil {
+			lastErr = err
+		}
+
+		if drainCtx.Err() != nil {
+			remaining := c.backlogSize()
+			if lastErr != nil {
+				c.abandonDrain(ctx, remaining, fmt.Errorf(
+					"%w: %d accepted job result(s) still unpersisted after %s (last error: %w)",
+					ErrDrainDeadlineExceeded, remaining, drainTimeout, lastErr,
+				))
+			} else {
+				c.abandonDrain(ctx, remaining, fmt.Errorf(
+					"%w: %d accepted job result(s) still unpersisted after %s",
+					ErrDrainDeadlineExceeded, remaining, drainTimeout,
+				))
+			}
+			return
+		}
+
+		if c.backlogSize() == 0 {
+			c.Logger.InfoContext(ctx, c.Name+": Drained all accepted job completions")
+			return
+		}
+
+		// Accepted results are normally already enqueued before drain begins
+		// because the client stops producers first. This wait only matters
+		// when the completer is stopped standalone while a result is arriving.
+		select {
+		case <-c.batchReadyChan:
+		case <-time.After(drainIdleWait):
+		case <-drainCtx.Done():
+		}
+	}
+}
+
+// abandonDrain records the drain failure, stops accepting new results, and
+// unblocks any producer waiting on backpressure. The run goroutine exits right
+// after, so a producer that was handed back its slot would otherwise wait
+// forever for a drain that will never happen.
+func (c *BatchCompleter) abandonDrain(ctx context.Context, remaining int, err error) {
+	c.setStopErr(err)
+	c.setAcceptingResults(false)
+
+	c.setStateParamsMu.Lock()
+	if c.waitOnBacklogWaiting {
+		close(c.waitOnBacklogChan)
+		c.waitOnBacklogWaiting = false
+	}
+	c.setStateParamsMu.Unlock()
+
+	attrs := []any{slog.String("err", err.Error())}
+	if remaining >= 0 {
+		attrs = append(attrs, slog.Int("num_jobs_unpersisted", remaining))
+	}
+	c.Logger.ErrorContext(ctx, c.Name+": Shutdown drain incomplete; unpersisted jobs are left in running state and will be rescued after restart", attrs...)
+}
+
+func (c *BatchCompleter) backlogSize() int {
+	c.setStateParamsMu.RLock()
+	defer c.setStateParamsMu.RUnlock()
+
+	return len(c.setStateParams)
 }
 
 func (c *BatchCompleter) handleBatch(ctx context.Context) error {
@@ -442,78 +668,36 @@ func (c *BatchCompleter) handleBatch(ctx context.Context) error {
 		return nil
 	}
 
-	handleBatchError := func(err error) error {
-		if isNonRetryableCompleterError(err) {
-			c.releaseBacklogWaitIfReady(ctx)
-			return err
-		}
-
-		c.requeueBatch(ctx, setStateBatch)
-		return err
+	// Order the accepted results so sub-batches are contiguous slices. This
+	// lets a partially failed write requeue only its own unconfirmed items
+	// instead of replaying items an earlier sub-batch already persisted.
+	items := make([]batchCompleterSetState, 0, len(setStateBatch))
+	for _, setState := range setStateBatch {
+		items = append(items, setState)
 	}
+	params := c.mapBatch(items)
 
-	// Complete a sub-batch with retries. Also helps reduce visual noise and
-	// increase readability of loop below.
-	completeSubBatch := func(batchParams *riverdriver.JobSetStateIfRunningManyParams) ([]*rivertype.JobRow, error) {
-		start := time.Now()
-		defer func() {
-			c.Logger.DebugContext(ctx, c.Name+": Completed sub-batch of job(s)", "duration", time.Since(start), "num_jobs", len(batchParams.ID))
-		}()
+	c.Logger.DebugContext(ctx, c.Name+": Completing batch of job(s)", slog.Int("num_jobs", len(items)))
 
-		return withRetries(ctx, &c.BaseService, c.disableSleep, func(ctx context.Context) ([]*rivertype.JobRow, error) {
-			rows, err := c.pilot.JobSetStateIfRunningMany(ctx, c.exec, batchParams)
-			if err != nil {
-				return nil, err
-			}
+	completeTime := c.Time.Now()
 
-			return rows, nil
-		})
-	}
+	// Events confirmed by sub-batches that completed successfully. They're
+	// aggregated and sent once so a partially failed write doesn't suppress
+	// events for already-confirmed items.
+	var confirmedEvents []CompleterJobUpdated
 
-	// This could be written more simply using multiple map helpers, but it's
-	// done this way to allocate as few new slices as necessary.
-	mapBatch := func(setStateBatch map[int64]batchCompleterSetState) *riverdriver.JobSetStateIfRunningManyParams {
-		params := &riverdriver.JobSetStateIfRunningManyParams{
-			ID:              make([]int64, len(setStateBatch)),
-			Attempt:         make([]*int, len(setStateBatch)),
-			ErrData:         make([][]byte, len(setStateBatch)),
-			FinalizedAt:     make([]*time.Time, len(setStateBatch)),
-			MetadataDoMerge: make([]bool, len(setStateBatch)),
-			MetadataUpdates: make([][]byte, len(setStateBatch)),
-			ScheduledAt:     make([]*time.Time, len(setStateBatch)),
-			State:           make([]rivertype.JobState, len(setStateBatch)),
-		}
-		var i int
-		for _, setState := range setStateBatch {
-			params.ID[i] = setState.Params.ID
-			params.Attempt[i] = setState.Params.Attempt
-			params.ErrData[i] = setState.Params.ErrData
-			params.FinalizedAt[i] = setState.Params.FinalizedAt
-			params.MetadataDoMerge[i] = setState.Params.MetadataDoMerge
-			params.MetadataUpdates[i] = setState.Params.MetadataUpdates
-			params.ScheduledAt[i] = setState.Params.ScheduledAt
-			params.State[i] = setState.Params.State
-			i++
-		}
-		params.Schema = c.schema
-		return params
-	}
+	// Write the batch as one or more sub-batches. A sub-batch is acknowledged
+	// only after its write succeeds, so if one fails, it and every sub-batch
+	// not yet attempted are requeued (or dropped), while earlier sub-batches
+	// are neither rewritten nor requeued.
+	for i := 0; i < len(items); i += c.completionMaxSize {
+		endIndex := min(i+c.completionMaxSize, len(items)) // beginning of next sub-batch or end of slice
 
-	// Tease apart enormous batches into sub-batches.
-	//
-	// All the code below is concerned with doing that, with a fast loop that
-	// doesn't allocate any additional memory in case the entire batch is
-	// smaller than the sub-batch maximum size (which will be the common case).
-	var (
-		params  = mapBatch(setStateBatch)
-		jobRows []*rivertype.JobRow
-	)
-	c.Logger.DebugContext(ctx, c.Name+": Completing batch of job(s)", "num_jobs", len(setStateBatch))
-	if len(setStateBatch) > c.completionMaxSize {
-		jobRows = make([]*rivertype.JobRow, 0, len(setStateBatch))
-		for i := 0; i < len(setStateBatch); i += c.completionMaxSize {
-			endIndex := min(i+c.completionMaxSize, len(params.ID)) // beginning of next sub-batch or end of slice
-			subBatch := &riverdriver.JobSetStateIfRunningManyParams{
+		// Fast path for the common case where the whole batch fits in one
+		// write: reuse the already-allocated parameter slices.
+		subBatch := params
+		if i != 0 || endIndex != len(items) {
+			subBatch = &riverdriver.JobSetStateIfRunningManyParams{
 				ID:              params.ID[i:endIndex],
 				Attempt:         params.Attempt[i:endIndex],
 				ErrData:         params.ErrData[i:endIndex],
@@ -524,46 +708,124 @@ func (c *BatchCompleter) handleBatch(ctx context.Context) error {
 				Schema:          params.Schema,
 				State:           params.State[i:endIndex],
 			}
-			jobRowsSubBatch, err := completeSubBatch(subBatch)
-			if err != nil {
-				return handleBatchError(err)
-			}
-			jobRows = append(jobRows, jobRowsSubBatch...)
 		}
-	} else {
-		var err error
-		jobRows, err = completeSubBatch(params)
+
+		jobRows, err := c.completeSubBatch(ctx, subBatch)
 		if err != nil {
-			return handleBatchError(err)
+			if !isNonRetryableCompleterError(err) {
+				// Requeue the failed sub-batch and any sub-batches that were
+				// never attempted: all unacknowledged items, nothing more.
+				c.requeueBatch(ctx, itemsToBatchMap(items[i:]))
+			}
+
+			c.deliverEvents(ctx, confirmedEvents)
+			c.releaseBacklogWaitIfReady(ctx)
+			return err
 		}
+
+		confirmedEvents = append(confirmedEvents, c.jobUpdatesForRows(jobRows, setStateBatch, completeTime)...)
 	}
 
-	var (
-		completeTime = c.Time.Now()
-		events       = make([]CompleterJobUpdated, 0, len(jobRows))
-	)
+	if !c.deliverEvents(ctx, confirmedEvents) {
+		// Every item was written, but the drain deadline expired while
+		// delivering its events. Report the deadline rather than succeeding.
+		c.releaseBacklogWaitIfReady(ctx)
+		return ctx.Err()
+	}
+
+	c.releaseBacklogWaitIfReady(ctx)
+
+	return nil
+}
+
+// deliverEvents sends subscription events to the downstream subscription
+// manager. During a bounded drain the send respects ctx, so a wedged consumer
+// can't extend shutdown indefinitely; in the uncanceled run-loop context it
+// behaves as an unconditional send. Returns false if ctx ended before the
+// events were handed off.
+func (c *BatchCompleter) deliverEvents(ctx context.Context, events []CompleterJobUpdated) bool {
+	if len(events) == 0 {
+		return true
+	}
+
+	select {
+	case c.subscribeCh <- events:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// completeSubBatch performs a single sub-batch write with retries. The passed
+// context bounds both database attempts and backoff sleeps, which lets the
+// shutdown drain enforce its deadline.
+func (c *BatchCompleter) completeSubBatch(ctx context.Context, batchParams *riverdriver.JobSetStateIfRunningManyParams) ([]*rivertype.JobRow, error) {
+	start := time.Now()
+	defer func() {
+		c.Logger.DebugContext(ctx, c.Name+": Completed sub-batch of job(s)",
+			slog.Duration("duration", time.Since(start)),
+			slog.Int("num_jobs", len(batchParams.ID)),
+		)
+	}()
+
+	return withRetries(ctx, ctx, &c.BaseService, c.disableSleep, func(ctx context.Context) ([]*rivertype.JobRow, error) {
+		rows, err := c.pilot.JobSetStateIfRunningMany(ctx, c.exec, batchParams)
+		if err != nil {
+			return nil, err
+		}
+
+		return rows, nil
+	})
+}
+
+// jobUpdatesForRows builds subscription updates for rows returned by a
+// confirmed sub-batch write.
+func (c *BatchCompleter) jobUpdatesForRows(jobRows []*rivertype.JobRow, setStateBatch map[int64]batchCompleterSetState, completeTime time.Time) []CompleterJobUpdated {
+	events := make([]CompleterJobUpdated, 0, len(jobRows))
 	for _, jobRow := range jobRows {
 		setState := setStateBatch[jobRow.ID]
 		setState.Stats.CompleteDuration = completeTime.Sub(setState.StartTime)
 		events = append(events, completerJobUpdatedFromStateAndReason(jobRow, setState.Stats, setState.Params.Reason))
 	}
+	return events
+}
 
-	if len(events) > 0 {
-		c.subscribeCh <- events
+// mapBatch converts accepted results into the driver's many-update parameter
+// shape. This could be written more simply using map helpers, but it's done
+// this way to allocate as few new slices as necessary.
+func (c *BatchCompleter) mapBatch(items []batchCompleterSetState) *riverdriver.JobSetStateIfRunningManyParams {
+	params := &riverdriver.JobSetStateIfRunningManyParams{
+		ID:              make([]int64, len(items)),
+		Attempt:         make([]*int, len(items)),
+		ErrData:         make([][]byte, len(items)),
+		FinalizedAt:     make([]*time.Time, len(items)),
+		MetadataDoMerge: make([]bool, len(items)),
+		MetadataUpdates: make([][]byte, len(items)),
+		ScheduledAt:     make([]*time.Time, len(items)),
+		State:           make([]rivertype.JobState, len(items)),
 	}
+	for i, setState := range items {
+		params.ID[i] = setState.Params.ID
+		params.Attempt[i] = setState.Params.Attempt
+		params.ErrData[i] = setState.Params.ErrData
+		params.FinalizedAt[i] = setState.Params.FinalizedAt
+		params.MetadataDoMerge[i] = setState.Params.MetadataDoMerge
+		params.MetadataUpdates[i] = setState.Params.MetadataUpdates
+		params.ScheduledAt[i] = setState.Params.ScheduledAt
+		params.State[i] = setState.Params.State
+	}
+	params.Schema = c.schema
+	return params
+}
 
-	func() {
-		c.setStateParamsMu.Lock()
-		defer c.setStateParamsMu.Unlock()
-
-		if c.waitOnBacklogWaiting && len(c.setStateParams) < c.backlogResumeThreshold() {
-			c.Logger.DebugContext(ctx, c.Name+": Disabling waitOnBacklog; ready to complete more jobs")
-			close(c.waitOnBacklogChan)
-			c.waitOnBacklogWaiting = false
-		}
-	}()
-
-	return nil
+// itemsToBatchMap indexes a slice of accepted results by job ID so it can be
+// requeued through requeueBatch.
+func itemsToBatchMap(items []batchCompleterSetState) map[int64]batchCompleterSetState {
+	batch := make(map[int64]batchCompleterSetState, len(items))
+	for _, item := range items {
+		batch[item.Params.ID] = item
+	}
+	return batch
 }
 
 func (c *BatchCompleter) releaseBacklogWaitIfReady(ctx context.Context) {
@@ -601,6 +863,17 @@ func (c *BatchCompleter) requeueBatch(ctx context.Context, setStateBatch map[int
 }
 
 func (c *BatchCompleter) JobSetStateIfRunning(ctx context.Context, stats *jobstats.JobStatistics, params *riverdriver.JobSetStateIfRunningParams) error {
+	// Once the shutdown drain has given up, the run goroutine is gone. Don't
+	// buffer a result that will never be persisted (or block on backpressure
+	// forever); return the recorded failure to the caller. The job's database
+	// row is left untouched and remains recoverable by the rescuer.
+	if !c.acceptingResults.Load() {
+		if stopErr := c.StopError(); stopErr != nil {
+			return stopErr
+		}
+		return ErrDrainDeadlineExceeded
+	}
+
 	now := c.Time.Now()
 
 	var backlogSize int
@@ -611,6 +884,11 @@ func (c *BatchCompleter) JobSetStateIfRunning(ctx context.Context, stats *jobsta
 		var waitChan <-chan struct{}
 		backlogSize, waitChan = c.tryEnqueueSetState(ctx, now, stats, params)
 		if waitChan != nil {
+			// Wait unconditionally for backpressure to clear: during a
+			// client shutdown the producers (and their executors) stop before
+			// the completer drains, and the drain releases this gate. The
+			// work context may be cancelled by then, but this final result
+			// still has to be accepted rather than dropped.
 			<-waitChan
 			continue
 		}
@@ -708,9 +986,13 @@ func isNonRetryableCompleterError(err error) bool {
 // ~37 seconds (7 seconds + 3 * 10 seconds).
 const numRetries = 3
 
-func withRetries[T any](logCtx context.Context, baseService *baseservice.BaseService, disableSleep bool, retryFunc func(ctx context.Context) (T, error)) (T, error) {
-	uncancelledCtx := context.WithoutCancel(logCtx)
-
+// withRetries invokes retryFunc with retries and exponential backoff. opCtx
+// bounds the actual database attempts (including the hot operation timeout),
+// while logCtx is used for logging and backoff sleeps. Callers that want
+// retries to survive service cancellation (but still respect a shutdown drain
+// deadline) pass a detached-but-deadline-bounded opCtx and the original
+// service context as logCtx.
+func withRetries[T any](opCtx, logCtx context.Context, baseService *baseservice.BaseService, disableSleep bool, retryFunc func(ctx context.Context) (T, error)) (T, error) {
 	var (
 		defaultVal T
 		lastErr    error
@@ -719,7 +1001,7 @@ func withRetries[T any](logCtx context.Context, baseService *baseservice.BaseSer
 	for attempt := 1; attempt <= numRetries; attempt++ {
 		// I've found that we want at least ten seconds for a large batch,
 		// although it usually doesn't need that long.
-		retVal, err := timeoututil.WithTimeoutV(uncancelledCtx, rivercommon.HotOperationTimeout, baseService.Name+".withRetries", retryFunc)
+		retVal, err := timeoututil.WithTimeoutV(opCtx, rivercommon.HotOperationTimeout, baseService.Name+".withRetries", retryFunc)
 		if err != nil {
 			// A cancelled context or a closed pool will never succeed.
 			if isNonRetryableCompleterError(err) {

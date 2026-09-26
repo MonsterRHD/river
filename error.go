@@ -1,6 +1,7 @@
 package river
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
@@ -9,6 +10,16 @@ import (
 
 // ErrJobCancelledRemotely is a sentinel error indicating that the job was cancelled remotely.
 var ErrJobCancelledRemotely = rivertype.ErrJobCancelledRemotely
+
+// ErrShutdownIncomplete is returned by Stop and StopAndCancel when the client
+// has stopped but one or more final job results already produced by workers
+// could not be persisted to the database before ShutdownTimeout elapsed (or
+// because the database became unavailable). Affected jobs are left in their
+// previous state in the database, usually `running`, so they remain
+// recoverable: the job rescuer will return them to the queue for another
+// attempt after RescueStuckJobsAfter. No job is reported as successful when
+// this error is returned.
+var ErrShutdownIncomplete = errors.New("river client shutdown incomplete: not all accepted job results were persisted")
 
 // JobCancelError is the error type returned by JobCancel. It should not be
 // initialized directly, but is returned from the [JobCancel] function and can

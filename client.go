@@ -55,6 +55,13 @@ const (
 	PriorityDefault          = rivercommon.PriorityDefault
 	QueueDefault             = rivercommon.QueueDefault
 	QueueNumWorkersMax       = 10_000
+
+	// ShutdownTimeoutDefault is the default maximum amount of time Stop and
+	// StopAndCancel wait for already-produced job results to be persisted
+	// during shutdown. It accommodates a full completer retry cycle (three
+	// attempts with ten second hot operation timeouts) plus a quick final
+	// write.
+	ShutdownTimeoutDefault = 1 * time.Minute
 )
 
 var (
@@ -377,6 +384,22 @@ type Config struct {
 	// setting of Postgres `search_path`.
 	Schema string
 
+	// ShutdownTimeout is the maximum amount of time that Stop and
+	// StopAndCancel will wait for final job results that workers have already
+	// produced to be persisted to the database (and for their subscription
+	// events to be handed off) after producers have stopped fetching and all
+	// in-progress jobs have finished.
+	//
+	// This timeout bounds only the final persistence phase of shutdown; it
+	// does not interrupt running jobs (use SoftStopTimeout for that). If it
+	// elapses before every accepted result is persisted, Stop or
+	// StopAndCancel returns ErrShutdownIncomplete. The unpersisted jobs remain
+	// in their previous state (usually running) and will be rescued and
+	// retried later, so no result is silently lost or reported as successful.
+	//
+	// Defaults to ShutdownTimeoutDefault (1 minute).
+	ShutdownTimeout time.Duration
+
 	// SoftStopTimeout is the maximum amount of time that the client will wait
 	// for running jobs to finish during a stop before their contexts are
 	// cancelled. After the timeout elapses, the client escalates to a hard stop
@@ -535,6 +558,7 @@ func (c *Config) WithDefaults() *Config {
 		RescueStuckJobsAfter:        cmp.Or(c.RescueStuckJobsAfter, rescueAfter),
 		RetryPolicy:                 retryPolicy,
 		Schema:                      c.Schema,
+		ShutdownTimeout:             cmp.Or(c.ShutdownTimeout, ShutdownTimeoutDefault),
 		SoftStopTimeout:             c.SoftStopTimeout,
 		SkipJobKindValidation:       c.SkipJobKindValidation,
 		SkipUnknownJobCheck:         c.SkipUnknownJobCheck,
@@ -589,6 +613,9 @@ func (c *Config) validate() error {
 	}
 	if c.RescueStuckJobsAfter < c.JobTimeout {
 		return errors.New("RescueStuckJobsAfter cannot be less than JobTimeout")
+	}
+	if c.ShutdownTimeout <= 0 {
+		return errors.New("ShutdownTimeout must be greater than zero")
 	}
 
 	// Max Postgres notification topic length is 63 and we prefix schema to
@@ -727,6 +754,19 @@ type Client[TTx any] struct {
 	subscriptionManager   *subscriptionManager
 	testSignals           clientTestSignals
 
+	// fetchCancel cancels the fetch context independently of baseStartStop,
+	// letting StopAndCancel block producers from fetching or starting new jobs
+	// before acquiring the base stop lock. Replaced on start, but a no-op in
+	// case StopAndCancel is called before start up.
+	fetchCancel context.CancelCauseFunc
+
+	// shutdownErr records an error from the final shutdown phase (e.g. the
+	// job completer failing to persist accepted results within
+	// ShutdownTimeout). It's returned from Stop and StopAndCancel once the
+	// client has stopped.
+	shutdownErrMu sync.Mutex
+	shutdownErr   error
+
 	// workCancel cancels the context used for all work goroutines. Normal Stop
 	// does not cancel that context.
 	workCancel context.CancelCauseFunc
@@ -848,6 +888,7 @@ func NewClient[TTx any](driver riverdriver.Driver[TTx], config *Config) (*Client
 		pluginLookupByJob:    pluginLookupByJob,
 		pluginLookupGlobal:   pluginLookupGlobal,
 		producersByQueueName: make(map[string]*producer),
+		fetchCancel:          func(cause error) {}, // replaced on start, but here in case StopAndCancel is called before start up
 		testSignals:          clientTestSignals{},
 		workCancel:           func(cause error) {}, // replaced on start, but here in case StopAndCancel is called before start up
 	}
@@ -904,7 +945,7 @@ func NewClient[TTx any](driver riverdriver.Driver[TTx], config *Config) (*Client
 			return nil, errMissingDatabasePoolWithQueues
 		}
 
-		client.completer = jobcompleter.NewBatchCompleter(archetype, config.Schema, driver.GetExecutor(), client.pilot, nil)
+		client.completer = jobcompleter.NewBatchCompleter(archetype, config.Schema, driver.GetExecutor(), client.pilot, nil, config.ShutdownTimeout)
 		client.subscriptionManager = newSubscriptionManager(archetype, nil)
 		client.services = append(client.services, client.completer, client.subscriptionManager)
 
@@ -1079,6 +1120,19 @@ func (c *Client[TTx]) Start(ctx context.Context) error {
 		return nil
 	}
 
+	// Wrap the fetch context so StopAndCancel can signal producers to stop
+	// fetching before it cancels work contexts. The wrapper inherits
+	// cancellation from the base start/stop context as usual, but can also be
+	// canceled independently, which is important because baseStartStop.StopInit
+	// serializes behind an in-flight Stop and therefore can't be used to
+	// deliver the hard-stop signal promptly.
+	var fetchCancel context.CancelCauseFunc
+	fetchCtx, fetchCancel = context.WithCancelCause(fetchCtx)
+
+	// Reset any error left over from a previous shutdown cycle in case the
+	// client is being started again.
+	c.setShutdownErr(nil)
+
 	c.queues.startStopMu.Lock()
 	defer c.queues.startStopMu.Unlock()
 
@@ -1174,12 +1228,16 @@ func (c *Client[TTx]) Start(ctx context.Context) error {
 
 		c.queues.fetchCtx = fetchCtx
 		c.queues.workCtx = workCtx
+		c.fetchCancel = fetchCancel
 		c.workCancel = workCancel
 
 		return nil
 	}(); err != nil {
 		defer stopped()
-		if errors.Is(context.Cause(fetchCtx), startstop.ErrStop) {
+		// A stop may be initiated either through baseStartStop (Stop/canceled
+		// start context) or directly via StopAndCancel's fetchCancel.
+		cause := context.Cause(fetchCtx)
+		if errors.Is(cause, startstop.ErrStop) || errors.Is(cause, rivercommon.ErrStop) {
 			return nil
 		}
 		return err
@@ -1234,21 +1292,46 @@ func (c *Client[TTx]) Start(ctx context.Context) error {
 
 		c.workCancel(rivercommon.ErrStop)
 
-		// Stop all mainline services where stop order isn't important.
-		startstop.StopAllParallel(append(
-			// This list of services contains the completer, which should always
-			// stop after the producers so that any remaining work that was enqueued
-			// will have a chance to have its state completed as it finishes.
-			//
-			// TODO: there's a risk here that the completer is stuck on a job that
-			// won't complete. We probably need a timeout or way to move on in those
-			// cases.
-			c.services,
+		// Stop all mainline services in parallel, except for the completer and
+		// subscription manager, which are stopped last and in order below:
+		// every result accepted by the completer has to reach the database,
+		// and the corresponding subscription event has to be distributed,
+		// before the client's stop completes.
+		servicesToStop := make([]startstop.Service, 0, len(c.services)+1)
+		for _, svc := range c.services {
+			if c.completer != nil && svc == c.completer {
+				continue
+			}
+			if c.subscriptionManager != nil && svc == c.subscriptionManager {
+				continue
+			}
+			servicesToStop = append(servicesToStop, svc)
+		}
 
-			// Will only be started if this client was leader, but can tolerate a
-			// stop without having been started.
-			c.queueMaintainer,
-		)...)
+		// Will only be started if this client was leader, but can tolerate a
+		// stop without having been started.
+		servicesToStop = append(servicesToStop, c.queueMaintainer)
+
+		startstop.StopAllParallel(servicesToStop...)
+
+		if c.completer != nil {
+			// Producers have stopped and every in-flight work unit has already
+			// handed its unique final result to the completer, so this drains
+			// accepted results to the database within ShutdownTimeout. Closing
+			// the completer's subscribe channel is what lets the subscription
+			// manager finish distributing the final events.
+			c.baseService.Logger.DebugContext(ctx, c.baseService.Name+": Draining job completer")
+			c.completer.Stop()
+
+			c.subscriptionManager.Stop()
+			c.baseService.Logger.DebugContext(ctx, c.baseService.Name+": Job completer drained")
+
+			// Surface a failed drain (deadline or non-retryable database
+			// error) through Stop/StopAndCancel rather than reporting success.
+			if stopErr := c.completerStopError(); stopErr != nil {
+				c.setShutdownErr(stopErr)
+			}
+		}
 	}()
 
 	return nil
@@ -1277,7 +1360,7 @@ func (c *Client[TTx]) Stop(ctx context.Context) error {
 		return ctx.Err()
 	case <-stopped:
 		finalizeStop(true)
-		return nil
+		return c.getShutdownErr()
 	}
 }
 
@@ -1299,6 +1382,13 @@ func (c *Client[TTx]) Stop(ctx context.Context) error {
 // StopAndCancel.
 func (c *Client[TTx]) StopAndCancel(ctx context.Context) error {
 	c.baseService.Logger.InfoContext(ctx, c.baseService.Name+": Hard stop started; cancelling all work")
+
+	// Block producers from fetching or starting new executions first, then
+	// cancel in-flight job contexts. This ordering ensures no new work can
+	// begin while jobs are being cancelled, and each active work unit still
+	// converges on exactly one final result (interruption, completion, or
+	// failure), which the completer drains before shutdown finishes.
+	c.fetchCancel(rivercommon.ErrStop)
 	c.workCancel(rivercommon.ErrStop)
 
 	shouldStop, stopped, finalizeStop := c.baseStartStop.StopInit()
@@ -1312,8 +1402,39 @@ func (c *Client[TTx]) StopAndCancel(ctx context.Context) error {
 		return ctx.Err()
 	case <-stopped:
 		finalizeStop(true)
+		return c.getShutdownErr()
+	}
+}
+
+// completerStopError returns ErrShutdownIncomplete wrapping the completer's
+// stop error if one or more accepted job results could not be persisted
+// during shutdown.
+func (c *Client[TTx]) completerStopError() error {
+	completerWithStopErr, ok := c.completer.(jobcompleter.ServiceWithStopError)
+	if !ok {
 		return nil
 	}
+
+	stopErr := completerWithStopErr.StopError()
+	if stopErr == nil {
+		return nil
+	}
+
+	return fmt.Errorf("%w: %w", ErrShutdownIncomplete, stopErr)
+}
+
+func (c *Client[TTx]) getShutdownErr() error {
+	c.shutdownErrMu.Lock()
+	defer c.shutdownErrMu.Unlock()
+
+	return c.shutdownErr
+}
+
+func (c *Client[TTx]) setShutdownErr(err error) {
+	c.shutdownErrMu.Lock()
+	defer c.shutdownErrMu.Unlock()
+
+	c.shutdownErr = err
 }
 
 // Stopped returns a channel that will be closed when the Client has stopped.

@@ -4,12 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/jackc/puddle/v2"
 	"github.com/stretchr/testify/require"
 
 	"github.com/riverqueue/river/internal/jobstats"
@@ -459,7 +459,7 @@ func TestBatchCompleter(t *testing.T) {
 
 	testCompleter(t, func(t *testing.T, schema string, exec riverdriver.Executor, pilot riverpilot.Pilot, subscribeChan chan<- []CompleterJobUpdated) *BatchCompleter {
 		t.Helper()
-		return NewBatchCompleter(riversharedtest.BaseServiceArchetype(t), schema, exec, pilot, subscribeChan)
+		return NewBatchCompleter(riversharedtest.BaseServiceArchetype(t), schema, exec, pilot, subscribeChan, 0)
 	},
 		func(completer *BatchCompleter) { completer.disableSleep = true },
 		4_400,
@@ -484,7 +484,7 @@ func TestBatchCompleter(t *testing.T) {
 			exec        = driver.GetExecutor()
 			pilot       = &riverpilot.StandardPilot{}
 			subscribeCh = make(chan []CompleterJobUpdated, 10)
-			completer   = NewBatchCompleter(riversharedtest.BaseServiceArchetype(t), schema, exec, pilot, subscribeCh)
+			completer   = NewBatchCompleter(riversharedtest.BaseServiceArchetype(t), schema, exec, pilot, subscribeCh, 0)
 		)
 
 		return completer, &testBundle{
@@ -525,13 +525,22 @@ func TestBatchCompleter(t *testing.T) {
 		// Wait for some jobs to come through, giving lots of opportunity for
 		// the completer to have pooled some completions and being forced to
 		// work them in sub-batches with our diminished sub-batch size.
-		riversharedtest.WaitOrTimeoutN(t, jobUpdateChan, 100)
+		riversharedtest.WaitOrTimeoutN(t, jobUpdateChan, 50)
+
+		// Drain events concurrently with shutdown. The completer's bounded
+		// drain can still be persisting accepted results while the producer
+		// finishes, and it (like the client's subscription manager) needs a
+		// live consumer for the whole duration of Stop.
+		drainDone := make(chan struct{})
+		go func() {
+			defer close(drainDone)
+			for range jobUpdateChan {
+			}
+		}()
 
 		stopInsertion()
-		go completer.Stop()
-		// drain all remaining jobs
-		for range jobUpdateChan {
-		}
+		completer.Stop()
+		<-drainDone
 	})
 
 	t.Run("BacklogWaitAndContinue", func(t *testing.T) {
@@ -557,13 +566,22 @@ func TestBatchCompleter(t *testing.T) {
 		// Wait for some jobs to come through. Waiting for these jobs to come
 		// through will provide plenty of opportunity for the completer to back
 		// up with our small configured backlog.
-		riversharedtest.WaitOrTimeoutN(t, jobUpdateChan, 100)
+		riversharedtest.WaitOrTimeoutN(t, jobUpdateChan, 50)
+
+		// Drain events concurrently with shutdown. The completer's bounded
+		// drain can still be persisting accepted results while the producer
+		// finishes, and it (like the client's subscription manager) needs a
+		// live consumer for the whole duration of Stop.
+		drainDone := make(chan struct{})
+		go func() {
+			defer close(drainDone)
+			for range jobUpdateChan {
+			}
+		}()
 
 		stopInsertion()
-		go completer.Stop()
-		// drain all remaining jobs
-		for range jobUpdateChan {
-		}
+		completer.Stop()
+		<-drainDone
 	})
 }
 
@@ -585,7 +603,7 @@ func TestBatchCompleter_BackpressureBeforeMaxBacklog(t *testing.T) {
 	}
 
 	subscribeCh := make(chan []CompleterJobUpdated, 1)
-	completer := NewBatchCompleter(riversharedtest.BaseServiceArchetype(t), "", execMock, &riverpilot.StandardPilot{}, subscribeCh)
+	completer := NewBatchCompleter(riversharedtest.BaseServiceArchetype(t), "", execMock, &riverpilot.StandardPilot{}, subscribeCh, 0)
 	completer.backlogWaitThreshold = 2
 	completer.completionMaxSize = 2
 	completer.disableSleep = true
@@ -628,7 +646,7 @@ func TestBatchCompleter_BackpressureReleasedAfterNonRetryableCompletionFailure(t
 	}
 
 	subscribeCh := make(chan []CompleterJobUpdated, 1)
-	completer := NewBatchCompleter(riversharedtest.BaseServiceArchetype(t), "", execMock, &riverpilot.StandardPilot{}, subscribeCh)
+	completer := NewBatchCompleter(riversharedtest.BaseServiceArchetype(t), "", execMock, &riverpilot.StandardPilot{}, subscribeCh, 0)
 	completer.backlogWaitThreshold = 2
 	completer.disableSleep = true
 	completer.maxBacklog = 100
@@ -684,7 +702,7 @@ func TestBatchCompleter_BackpressureRequeuesBatchAfterCompletionFailure(t *testi
 	}
 
 	subscribeCh := make(chan []CompleterJobUpdated, 1)
-	completer := NewBatchCompleter(riversharedtest.BaseServiceArchetype(t), "", execMock, &riverpilot.StandardPilot{}, subscribeCh)
+	completer := NewBatchCompleter(riversharedtest.BaseServiceArchetype(t), "", execMock, &riverpilot.StandardPilot{}, subscribeCh, 0)
 	completer.backlogWaitThreshold = 2
 	completer.completionMaxSize = 10
 	completer.disableSleep = true
@@ -738,7 +756,7 @@ func TestBatchCompleter_NonRetryableCompletionFailureDoesNotRequeueBatch(t *test
 			}
 
 			subscribeCh := make(chan []CompleterJobUpdated, 1)
-			completer := NewBatchCompleter(riversharedtest.BaseServiceArchetype(t), "", execMock, &riverpilot.StandardPilot{}, subscribeCh)
+			completer := NewBatchCompleter(riversharedtest.BaseServiceArchetype(t), "", execMock, &riverpilot.StandardPilot{}, subscribeCh, 0)
 			completer.disableSleep = true
 
 			require.NoError(t, completer.JobSetStateIfRunning(ctx, &jobstats.JobStatistics{}, riverdriver.JobSetStateCompleted(1, time.Now(), nil)))
@@ -752,6 +770,201 @@ func TestBatchCompleter_NonRetryableCompletionFailureDoesNotRequeueBatch(t *test
 			require.Empty(t, completer.setStateParams)
 			completer.setStateParamsMu.RUnlock()
 		})
+	}
+}
+
+func TestBatchCompleter_PartialSubBatchFailureRetriesOnlyUnacknowledged(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	var (
+		expectedErr       = errors.New("error from batch completion")
+		failJobID   int64 = 4
+
+		mu                 sync.Mutex
+		attemptsByJobID    = make(map[int64]int)
+		acknowledgedJobIDs = make(map[int64]bool)
+		failedCallIDs      []int64
+	)
+
+	// The sub-batch containing failJobID fails for a full retry cycle
+	// (numRetries attempts) the first time it's handled, then succeeds. Every
+	// other write succeeds immediately.
+	execMock := &partialExecutorMock{}
+	execMock.JobSetStateIfRunningManyFunc = func(ctx context.Context, params *riverdriver.JobSetStateIfRunningManyParams) ([]*rivertype.JobRow, error) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		for _, id := range params.ID {
+			attemptsByJobID[id]++
+		}
+
+		if slices.Contains(params.ID, failJobID) && attemptsByJobID[failJobID] <= numRetries {
+			// Record the failing sub-batch on its final failed attempt.
+			failedCallIDs = append(failedCallIDs[:0], params.ID...)
+			return nil, expectedErr
+		}
+
+		for _, id := range params.ID {
+			acknowledgedJobIDs[id] = true
+		}
+
+		rows := make([]*rivertype.JobRow, len(params.ID))
+		for i, id := range params.ID {
+			rows[i] = &rivertype.JobRow{ID: id, State: rivertype.JobStateCompleted}
+		}
+		return rows, nil
+	}
+
+	subscribeCh := make(chan []CompleterJobUpdated, 10)
+	t.Cleanup(riverinternaltest.DiscardContinuously(subscribeCh))
+	completer := NewBatchCompleter(riversharedtest.BaseServiceArchetype(t), "", execMock, &riverpilot.StandardPilot{}, subscribeCh, 0)
+	completer.completionMaxSize = 2
+	completer.disableSleep = true
+	t.Cleanup(completer.Stop)
+
+	for id := int64(1); id <= 4; id++ {
+		require.NoError(t, completer.JobSetStateIfRunning(ctx, &jobstats.JobStatistics{}, riverdriver.JobSetStateCompleted(id, time.Now(), nil)))
+	}
+
+	// First handle: the sub-batch containing job 4 fails its whole retry
+	// cycle. The failed sub-batch, plus any sub-batch not yet attempted, must
+	// be requeued; already acknowledged items must not be.
+	require.ErrorIs(t, completer.handleBatch(ctx), expectedErr)
+
+	require.NotEmpty(t, failedCallIDs)
+	mu.Lock()
+	var expectedRequeued []int64
+	for id := int64(1); id <= 4; id++ {
+		if !acknowledgedJobIDs[id] {
+			expectedRequeued = append(expectedRequeued, id)
+		}
+	}
+	mu.Unlock()
+
+	completer.setStateParamsMu.RLock()
+	require.Len(t, completer.setStateParams, len(expectedRequeued))
+	for _, id := range expectedRequeued {
+		require.Contains(t, completer.setStateParams, id)
+	}
+	completer.setStateParamsMu.RUnlock()
+
+	// Second handle: the unacknowledged items persist successfully.
+	require.NoError(t, completer.handleBatch(ctx))
+
+	// Items confirmed before the failure must never be rewritten (one write
+	// attempt). The failed items had numRetries failed attempts plus one
+	// successful retry; items that were never attempted until the retry also
+	// see exactly one write.
+	mu.Lock()
+	defer mu.Unlock()
+	for id := int64(1); id <= 4; id++ {
+		if slices.Contains(failedCallIDs, id) {
+			require.Equal(t, numRetries+1, attemptsByJobID[id], "unacknowledged job %d should have been retried", id)
+		} else {
+			require.Equal(t, 1, attemptsByJobID[id], "job %d must not have been written more than once", id)
+		}
+	}
+}
+
+func TestBatchCompleter_DrainDeadlineExceededLeavesJobsRunning(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	tx := riverdbtest.TestTxPgx(ctx, t)
+	driver := riverpgxv5.New(nil)
+	exec := driver.UnwrapExecutor(tx)
+
+	job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{State: new(rivertype.JobStateRunning)})
+
+	// Every write fails with a retryable error, so the bounded drain can't
+	// catch up.
+	execMock := NewPartialExecutorMock(exec)
+	execMock.JobSetStateIfRunningManyFunc = func(ctx context.Context, params *riverdriver.JobSetStateIfRunningManyParams) ([]*rivertype.JobRow, error) {
+		return nil, errors.New("database unavailable")
+	}
+
+	subscribeCh := make(chan []CompleterJobUpdated, 10)
+	t.Cleanup(riverinternaltest.DiscardContinuously(subscribeCh))
+
+	completer := NewBatchCompleter(riversharedtest.BaseServiceArchetype(t), "", execMock, &riverpilot.StandardPilot{}, subscribeCh, 50*time.Millisecond)
+	completer.disableSleep = true
+	require.NoError(t, completer.Start(ctx))
+
+	require.NoError(t, completer.JobSetStateIfRunning(ctx, &jobstats.JobStatistics{}, riverdriver.JobSetStateCompleted(job.ID, time.Now(), nil)))
+
+	start := time.Now()
+	completer.Stop()
+	// The drain must give up promptly at its deadline instead of hanging on a
+	// full retry cycle, with a little slack for scheduling.
+	require.Less(t, time.Since(start), 5*time.Second)
+
+	require.ErrorIs(t, completer.StopError(), ErrDrainDeadlineExceeded)
+
+	// Recoverable state: the database row is untouched and still running, so
+	// the rescuer will pick it up rather than the job being faked as
+	// completed.
+	jobAfter, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID, Schema: ""})
+	require.NoError(t, err)
+	require.Equal(t, rivertype.JobStateRunning, jobAfter.State)
+	require.Nil(t, jobAfter.FinalizedAt)
+}
+
+func TestBatchCompleter_DrainNonRetryableErrorSetsStopError(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	execMock := &partialExecutorMock{}
+	execMock.JobSetStateIfRunningManyFunc = func(ctx context.Context, params *riverdriver.JobSetStateIfRunningManyParams) ([]*rivertype.JobRow, error) {
+		return nil, riverdriver.ErrClosedPool
+	}
+
+	subscribeCh := make(chan []CompleterJobUpdated, 10)
+	t.Cleanup(riverinternaltest.DiscardContinuously(subscribeCh))
+
+	completer := NewBatchCompleter(riversharedtest.BaseServiceArchetype(t), "", execMock, &riverpilot.StandardPilot{}, subscribeCh, time.Second)
+	completer.disableSleep = true
+	require.NoError(t, completer.Start(ctx))
+
+	require.NoError(t, completer.JobSetStateIfRunning(ctx, &jobstats.JobStatistics{}, riverdriver.JobSetStateCompleted(1, time.Now(), nil)))
+
+	completer.Stop()
+
+	require.ErrorIs(t, completer.StopError(), riverdriver.ErrClosedPool)
+}
+
+func TestBatchCompleter_SuccessfulDrainHasNoStopError(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	tx := riverdbtest.TestTxPgx(ctx, t)
+	driver := riverpgxv5.New(nil)
+	exec := driver.UnwrapExecutor(tx)
+
+	job1 := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{State: new(rivertype.JobStateRunning)})
+	job2 := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{State: new(rivertype.JobStateRunning)})
+
+	subscribeCh := make(chan []CompleterJobUpdated, 10)
+	t.Cleanup(riverinternaltest.DiscardContinuously(subscribeCh))
+
+	completer := NewBatchCompleter(riversharedtest.BaseServiceArchetype(t), "", exec, &riverpilot.StandardPilot{}, subscribeCh, time.Second)
+	require.NoError(t, completer.Start(ctx))
+
+	require.NoError(t, completer.JobSetStateIfRunning(ctx, &jobstats.JobStatistics{}, riverdriver.JobSetStateCompleted(job1.ID, time.Now(), nil)))
+	require.NoError(t, completer.JobSetStateIfRunning(ctx, &jobstats.JobStatistics{}, riverdriver.JobSetStateCompleted(job2.ID, time.Now(), nil)))
+
+	completer.Stop()
+
+	require.NoError(t, completer.StopError())
+
+	for _, job := range []*rivertype.JobRow{job1, job2} {
+		jobAfter, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID, Schema: ""})
+		require.NoError(t, err)
+		require.Equal(t, rivertype.JobStateCompleted, jobAfter.State)
 	}
 }
 
@@ -782,7 +995,7 @@ func TestBatchCompleter_JobStatsSnapshotsPerUpdate(t *testing.T) {
 		}
 
 		subscribeCh := make(chan []CompleterJobUpdated, 2)
-		completer := NewBatchCompleter(riversharedtest.BaseServiceArchetype(t), "", execMock, &riverpilot.StandardPilot{}, subscribeCh)
+		completer := NewBatchCompleter(riversharedtest.BaseServiceArchetype(t), "", execMock, &riverpilot.StandardPilot{}, subscribeCh, 0)
 		completer.disableSleep = true
 
 		return &testBundle{
@@ -1234,7 +1447,9 @@ func testCompleter[TCompleter JobCompleter](
 
 		execMock := NewPartialExecutorMock(bundle.exec)
 		execMock.JobSetStateIfRunningManyFunc = func(ctx context.Context, params *riverdriver.JobSetStateIfRunningManyParams) ([]*rivertype.JobRow, error) {
-			return nil, puddle.ErrClosedPool
+			// Drivers map a closed pool to this sentinel before it reaches
+			// the completer, which treats it as non-retryable.
+			return nil, riverdriver.ErrClosedPool
 		}
 		setExec(completer, execMock)
 
@@ -1244,7 +1459,7 @@ func testCompleter[TCompleter JobCompleter](
 
 		// The error returned will be nil for asynchronous completers, but
 		// returned immediately for synchronous ones.
-		require.True(t, err == nil || errors.Is(err, puddle.ErrClosedPool))
+		require.True(t, err == nil || errors.Is(err, riverdriver.ErrClosedPool))
 
 		completer.Stop()
 
@@ -1287,7 +1502,7 @@ func BenchmarkAsyncCompleter_Concurrency100(b *testing.B) {
 func BenchmarkBatchCompleter(b *testing.B) {
 	benchmarkCompleter(b, func(b *testing.B, schema string, exec riverdriver.Executor, pilot riverpilot.Pilot, subscribeChan chan<- []CompleterJobUpdated) JobCompleter {
 		b.Helper()
-		return NewBatchCompleter(riversharedtest.BaseServiceArchetype(b), schema, exec, pilot, subscribeChan)
+		return NewBatchCompleter(riversharedtest.BaseServiceArchetype(b), schema, exec, pilot, subscribeChan, 0)
 	})
 }
 

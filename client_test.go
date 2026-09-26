@@ -2781,6 +2781,55 @@ func Test_Client_StopAndCancel(t *testing.T) {
 		riversharedtest.WaitOrTimeout(t, client.Stopped())
 	})
 
+	t.Run("PersistsInterruptedResultsAndEvents", func(t *testing.T) {
+		t.Parallel()
+
+		config := newTestConfig(t, "")
+
+		type JobArgs struct {
+			testutil.JobArgsReflectKind[JobArgs]
+		}
+
+		jobStartedChan := make(chan struct{}, 1)
+		AddWorker(config.Workers, WorkFunc(func(ctx context.Context, job *Job[JobArgs]) error {
+			jobStartedChan <- struct{}{}
+			<-ctx.Done()
+			return ctx.Err()
+		}))
+
+		client := runNewTestClient(ctx, t, config)
+
+		subscribeChan, cancelSubscribe := client.Subscribe(EventKindJobInterrupted)
+		t.Cleanup(cancelSubscribe)
+
+		insertRes, err := client.Insert(ctx, JobArgs{}, nil)
+		require.NoError(t, err)
+
+		riversharedtest.WaitOrTimeout(t, jobStartedChan)
+
+		// Hard stop cancels the job context; its interrupted result has to be
+		// persisted and its event delivered before the call returns.
+		require.NoError(t, client.StopAndCancel(ctx))
+
+		event := riversharedtest.WaitOrTimeout(t, subscribeChan)
+		require.Equal(t, EventKindJobInterrupted, event.Kind)
+		require.Equal(t, insertRes.Job.ID, event.Job.ID)
+		require.Equal(t, rivertype.JobStateAvailable, event.Job.State)
+		require.NotNil(t, event.JobStats)
+
+		jobAfter, err := client.driver.GetExecutor().JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: insertRes.Job.ID, Schema: client.config.Schema})
+		require.NoError(t, err)
+		require.Equal(t, rivertype.JobStateAvailable, jobAfter.State)
+		require.Zero(t, jobAfter.Attempt)
+		require.Nil(t, jobAfter.FinalizedAt)
+
+		// No final result was lost in the completer: nothing is left running
+		// for the rescuer to pick up.
+		listRes, err := client.JobList(ctx, NewJobListParams().States(rivertype.JobStateRunning))
+		require.NoError(t, err)
+		require.Empty(t, listRes.Jobs)
+	})
+
 	t.Run("BeforeStart", func(t *testing.T) {
 		t.Parallel()
 
@@ -9069,18 +9118,40 @@ func Test_NewClient_Validations(t *testing.T) {
 			wantErr: errors.New("Schema name can only contain letters, numbers, and underscores, and must start with a letter or underscore"),
 		},
 		{
-			name: "Queues can be nil when Workers is also nil",
-			configFunc: func(config *Config) {
-				config.Queues = nil
-				config.Workers = nil
-			},
+		name:       "ShutdownTimeout of zero applies ShutdownTimeoutDefault",
+		configFunc: func(config *Config) { config.ShutdownTimeout = 0 },
+		wantErr:    nil,
+		validateResult: func(t *testing.T, client *Client[pgx.Tx]) { //nolint:thelper
+			require.Equal(t, ShutdownTimeoutDefault, client.config.ShutdownTimeout)
 		},
-		{
-			name: "Queues can be nil when Workers is not nil",
-			configFunc: func(config *Config) {
-				config.Queues = nil
-			},
+	},
+	{
+		name:       "ShutdownTimeout cannot be negative",
+		configFunc: func(config *Config) { config.ShutdownTimeout = -1 },
+		wantErr:    errors.New("ShutdownTimeout must be greater than zero"),
+	},
+	{
+		name: "ShutdownTimeout can be overridden",
+		configFunc: func(config *Config) {
+			config.ShutdownTimeout = 30 * time.Second
 		},
+		validateResult: func(t *testing.T, client *Client[pgx.Tx]) { //nolint:thelper
+			require.Equal(t, 30*time.Second, client.config.ShutdownTimeout)
+		},
+	},
+	{
+		name: "Queues can be nil when Workers is also nil",
+		configFunc: func(config *Config) {
+			config.Queues = nil
+			config.Workers = nil
+		},
+	},
+	{
+		name: "Queues can be nil when Workers is not nil",
+		configFunc: func(config *Config) {
+			config.Queues = nil
+		},
+	},
 		{
 			name:       "Queues can be empty",
 			configFunc: func(config *Config) { config.Queues = make(map[string]QueueConfig) },

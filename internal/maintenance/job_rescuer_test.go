@@ -298,6 +298,56 @@ func TestJobRescuer(t *testing.T) {
 		require.Equal(t, rivertype.JobStateRunning, noTimeoutJobAfter.State)
 	})
 
+	t.Run("DistinguishesFinalizedJobsFromStaleAttemptsAfterRestart", func(t *testing.T) {
+		t.Parallel()
+
+		// Models a process restart where the previous process's completer
+		// finalized some jobs while other attempts were never committed. Both
+		// rows have an old attempted_at, but only the running row belongs to
+		// an uncommitted attempt and is eligible for rescue.
+		rescuer, bundle := setup(t)
+
+		finalizedAt := bundle.rescueHorizon.Add(-30 * time.Minute)
+
+		finalizedJob := testfactory.Job(ctx, t, bundle.exec, &testfactory.JobOpts{
+			Kind:        new(rescuerJobKind),
+			State:       new(rivertype.JobStateCompleted),
+			Attempt:     new(2),
+			AttemptedAt: new(bundle.rescueHorizon.Add(-1 * time.Hour)),
+			FinalizedAt: &finalizedAt,
+			MaxAttempts: new(5),
+		})
+		staleRunningJob := testfactory.Job(ctx, t, bundle.exec, &testfactory.JobOpts{
+			Kind:        new(rescuerJobKind),
+			State:       new(rivertype.JobStateRunning),
+			Attempt:     new(1),
+			AttemptedAt: new(bundle.rescueHorizon.Add(-1 * time.Hour)),
+			MaxAttempts: new(5),
+		})
+
+		res, err := rescuer.runOnce(ctx)
+		require.NoError(t, err)
+		require.Equal(t, int64(1), res.NumJobsRetried)
+		require.Zero(t, res.NumJobsCancelled)
+		require.Zero(t, res.NumJobsDiscarded)
+
+		// The job finalized by the previous process must be left exactly as
+		// it was, rather than rescued as if it were still running.
+		finalizedJobAfter, err := bundle.exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: finalizedJob.ID, Schema: rescuer.Config.Schema})
+		require.NoError(t, err)
+		require.Equal(t, rivertype.JobStateCompleted, finalizedJobAfter.State)
+		require.WithinDuration(t, finalizedAt, *finalizedJobAfter.FinalizedAt, time.Microsecond)
+		require.Equal(t, 2, finalizedJobAfter.Attempt)
+		require.Empty(t, finalizedJobAfter.Errors)
+
+		// The stale, uncommitted attempt is rescued and scheduled for retry.
+		staleRunningJobAfter, err := bundle.exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: staleRunningJob.ID, Schema: rescuer.Config.Schema})
+		require.NoError(t, err)
+		require.Equal(t, rivertype.JobStateRetryable, staleRunningJobAfter.State)
+		require.Nil(t, staleRunningJobAfter.FinalizedAt)
+		require.Len(t, staleRunningJobAfter.Errors, 1)
+	})
+
 	t.Run("RescuesInBatches", func(t *testing.T) {
 		t.Parallel()
 
