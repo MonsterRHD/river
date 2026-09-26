@@ -27,7 +27,7 @@
   {
     "id": 6,
     "passed": false,
-    "reason": "PostgreSQL 连接拒绝使 drain deadline 的数据库恢复用例未执行。"
+    "reason": "数据库连接被拒绝使 drain deadline 的数据库恢复用例未执行。"
   },
   {
     "id": 7,
